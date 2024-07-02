@@ -1,862 +1,4 @@
-# Issue H-1: after the TWAB limit is reached, back-running a call to `withdraw` with a liquidation of yield is extremely profitable for the liquidator at the expense of all the other users in the vault 
-
-Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/19 
-
-The protocol has acknowledged this issue.
-
-## Found by 
-0xSpearmint1
-## Summary
-after the TWAB limit is reached, back-running a call to `withdraw` with a liquidation of yield is extremely profitable for the liquidator at the expense of all the other users in the vault
-
-## Vulnerability Detail
-The price of liquidating yield is inversely proportional to the `elapsedTime` 
-
-```solidity
-function _computePrice() internal view returns (uint192) {
-        uint256 elapsedTime = block.timestamp - lastAuctionAt;
-        if (elapsedTime == 0) {
-            return type(uint192).max;
-        }
-        uint192 price = uint192((targetAuctionPeriod * lastAuctionPrice) / elapsedTime);
-
-        if (price < MIN_PRICE) {
-            price = MIN_PRICE;
-        }
-
-        return price;
-    }
-```
-
-Once the `TWAB_SUPPLY_LIMIT` is reached, all liquidation attempts will revert due to the `_enforceMintLimit()` in `transferTokensOut()`
-
-A liquidator can take advantage of this by the following steps
-
-1. `TWAB_SUPPLY_LIMIT` is reached for a vault, at this point any future liquidations will revert, but `elapsedTime` keeps accruing
-
-2. Once price = MIN_PRICE, due to a large `elapsedTime`, the liquidator will withdraw some assets from the vault, this will burn some shares and reduce the totalSupply
-
-3. The liquidator will immediately backrun the `withdraw` call with a liquidation at price = MIN_PRICE for a huge profit at the expense of the other vault users
-
-The result will be the attacker exchanging very few prizeTokens for all the yield.
-
-
-A key point to note is that if some other user withdraws before the price = MIN_PRICE, the liquidator can backrun that users Tx with a deposit to reach the `TWAB_SUPPLY_LIMIT` and prevent other liquidations.
-
-TWAB_SUPPLY_LIMIT = type(uint96).max 
-
-This is easily achievable for ERC20's with a large totalSupply and low price for example SHIBE or LADYS
-
-The protocol stated in the README
->The protocol supports any standard ERC20 that does not have reentrancy or fee on transfer.
-
-Therefore it should support tokens like SHIBE and LADYS ( they fit the criteria ) but the PrizeVaults do not
-
-## Impact
-The attacker has effectively stolen the yield from other users. 
-
-The attacker has reduced the chances of winning for all other users of that vault.
-
-## Proof of concept
-Replace the existing `BaseIntegration.t.sol` in /2024-05-pooltogether/pt-v5-vault/test/integration/BaseIntegration.t.sol with the following 
-<details>
-
-```solidity
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
-
-import { Test } from "forge-std/Test.sol";
-import { console2 } from "forge-std/console2.sol";
-
-import { IERC20, IERC4626 } from "openzeppelin/token/ERC20/extensions/ERC4626.sol";
-
-import { PrizePool } from "pt-v5-prize-pool/PrizePool.sol";
-import { TwabController } from "pt-v5-twab-controller/TwabController.sol";
-
-import { ERC20PermitMock } from "../contracts/mock/ERC20PermitMock.sol";
-import { PrizePoolMock } from "../contracts/mock/PrizePoolMock.sol";
-import { Permit } from "../contracts/utility/Permit.sol";
-
-import { PrizeVaultWrapper, PrizeVault } from "../contracts/wrapper/PrizeVaultWrapper.sol";
-
-import { YieldVault } from "../contracts/mock/YieldVault.sol";
-
-abstract contract BaseIntegration is Test, Permit {
-
-    /* ============ events ============ */
-
-    event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares);
-    event Transfer(address indexed from, address indexed to, uint256 value);
-    event ClaimerSet(address indexed claimer);
-    event LiquidationPairSet(address indexed tokenOut, address indexed liquidationPair);
-    event YieldFeeRecipientSet(address indexed yieldFeeRecipient);
-    event YieldFeePercentageSet(uint256 yieldFeePercentage);
-    event MockContribute(address prizeVault, uint256 amount);
-    event ClaimYieldFeeShares(address indexed recipient, uint256 shares);
-    event TransferYieldOut(address indexed liquidationPair, address indexed tokenOut, address indexed recipient, uint256 amountOut, uint256 yieldFee);
-    event Sponsor(address indexed caller, uint256 assets, uint256 shares);
-
-    /* ============ variables ============ */
-
-    address public vitalik = 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045;
-    address public attacker = 0xEf57e88a27f8958D72fd9F983D28349374e6C110;
-
-    address internal owner;
-    uint256 internal ownerPrivateKey;
-
-    address internal alice;
-    uint256 internal alicePrivateKey;
-
-    address internal bob;
-    uint256 internal bobPrivateKey;
-
-    PrizeVaultWrapper public prizeVault;
-    string public vaultName = "PoolTogether Test Vault";
-    string public vaultSymbol = "pTest";
-    uint256 public yieldBuffer = 1e5;
-
-    IERC4626 public yieldVault;
-    ERC20PermitMock public underlyingAsset;
-    uint8 public assetDecimals;
-    uint256 public approxAssetUsdExchangeRate;
-    ERC20PermitMock public prizeToken;
-
-    address public claimer;
-    PrizePoolMock public prizePool;
-
-    uint32 public drawPeriodSeconds = 1 days;
-    TwabController public twabController;
-
-    /// @dev A low gas estimate of what it would cost in gas to manipulate the state into losing 1 wei of assets
-    /// in a rounding error. (This should be a unachievable low estimate such that an attacker would never be able
-    /// to cause repeated rounding errors for less).
-    uint256 lowGasEstimateForStateChange = 100_000;
-
-    /// @dev A low gas price estimate for the chain.
-    uint256 lowGasPriceEstimate = 7 gwei;
-
-    /// @dev Defined in 1e18 precision. (2e18 would be 2 ETH per USD)
-    uint256 approxEthUsdExchangeRate = uint256(1e18) / uint256(3000); // approx 1 ETH for $3000
-
-    /// @dev Override to true if vault is not expected to have yield
-    bool ignoreYield = false;
-
-    /// @dev Override to true if vault cannot feasibly lose assets
-    bool ignoreLoss = false;
-
-    /// @dev Some yield vaults have predictable precision loss (such as Sonne which reduces precision of assets with their exchange rate).
-    /// This optional variable can be set if this precision loss is acknowledged and appropriate countermeasures will be taken (ex. deploying
-    /// a PrizeVault with a higher yield buffer to match the reduced precision).
-    uint8 assetPrecisionLoss = 0;
-
-    /* ============ setup ============ */
-
-    function setUpUnderlyingAsset() public virtual returns (IERC20 asset, uint8 decimals, uint256 approxAssetUsdExchangeRate);
-
-    function setUpYieldVault() public virtual returns (IERC4626) {
-        return new YieldVault(
-            address(underlyingAsset),
-            "Test Yield Vault",
-            "yvTest"
-        );
-    }
-
-    function setUpFork() public virtual;
-
-    function beforeSetup() public virtual;
-
-    function afterSetup() public virtual;
-
-    function setUp() public virtual {
-        beforeSetup();
-
-        (owner, ownerPrivateKey) = makeAddrAndKey("Owner");
-        (alice, alicePrivateKey) = makeAddrAndKey("Alice");
-        (bob, bobPrivateKey) = makeAddrAndKey("Bob");
-
-        underlyingAsset = new ERC20PermitMock("SHIBE");
-
-        yieldVault = setUpYieldVault();
-
-        
-
-        prizeToken = new ERC20PermitMock("POOL");
-
-        twabController = new TwabController(1 hours, uint32(block.timestamp));
-
-        prizePool = new PrizePoolMock(prizeToken, twabController);
-
-        claimer = address(0xe291d9169F0316272482dD82bF297BB0a11D267f);
-
-        // adjust yield buffer based-on mitigated precision loss
-        yieldBuffer = 1e5 * (10 ** assetPrecisionLoss);
-
-        prizeVault = new PrizeVaultWrapper(
-            vaultName,
-            vaultSymbol,
-            yieldVault,
-            PrizePool(address(prizePool)),
-            claimer,
-            bob,
-            9e8,
-            yieldBuffer, // yield buffer
-            address(this)
-        );
-        prizeVault.setLiquidationPair(address(this));
-
-        // Fill yield buffer if non-zero:
-        if (yieldBuffer > 0) {
-            dealAssets(address(prizeVault), yieldBuffer);
-        }
-
-        afterSetup();
-    }
-
-    /* ============ prank helpers ============ */
-
-    address private currentPrankee;
-
-    /// @notice should be used instead of vm.startPrank so we can keep track of pranks within other pranks
-    function startPrank(address prankee) public {
-        currentPrankee = prankee;
-        vm.startPrank(prankee);
-    }
-
-    /// @notice should be used instead of vm.stopPrank so we can keep track of pranks within other pranks
-    function stopPrank() public {
-        currentPrankee = address(0);
-        vm.stopPrank();
-    }
-
-    /// @notice pranks the address and sets the prank back to the msg sender at the end
-    modifier prankception(address prankee) {
-        address prankBefore = currentPrankee;
-        vm.stopPrank();
-        vm.startPrank(prankee);
-        _;
-        vm.stopPrank();
-        if (prankBefore != address(0)) {
-            vm.startPrank(prankBefore);
-        }
-    }
-
-    /* ============ helpers to override ============ */
-
-    /// @dev The max amount of assets than can be dealt.
-    function maxDeal() public virtual returns (uint256);
-
-    /// @dev May revert if the amount requested exceeds the amount available to deal.
-    function dealAssets(address to, uint256 amount) public virtual;
-
-    /// @dev Some yield sources accrue by time, so it's difficult to accrue an exact amount. Call the 
-    /// function multiple times if the test requires the accrual of more yield than the default amount.
-    function _accrueYield() internal virtual;
-
-    /// @dev Simulates loss on the yield vault such that the value of it's shares drops
-    function _simulateLoss() internal virtual;
-
-    /// @dev Each integration test must override the `_accrueYield` internal function for this to work.
-    function accrueYield() public returns (uint256) {
-        uint256 assetsBefore = prizeVault.totalPreciseAssets();
-        _accrueYield();
-        uint256 assetsAfter = prizeVault.totalPreciseAssets();
-        if (yieldVault.balanceOf(address(prizeVault)) > 0) {
-            // if the prize vault has any yield vault shares, check to ensure yield has accrued
-            require(assetsAfter > assetsBefore, "yield did not accrue");
-        } else {
-            if (underlyingAsset.balanceOf(address(prizeVault)) > 0) {
-                // the underlying asset might be rebasing in some setups, so it's possible time passing has caused an increase in latent balance
-                require(assetsAfter >= assetsBefore, "assets decreased while holding latent balance");
-            } else {
-                // otherwise, we should expect no change on the prize vault
-                require(assetsAfter == assetsBefore, "assets changed with zero yield shares");
-            }
-        }
-        return assetsAfter - assetsBefore;
-    }
-
-    function checkIgnoreYield() internal returns (bool) {
-        if (ignoreYield) {
-            console2.log("skipping test since yield is ignored...");
-            return true;
-        }
-        return false;
-    }
-
-    /// @dev Each integration test must override the `_simulateLoss` internal function for this to work.
-    /// @return The loss the prize vault has incurred as a result of yield vault loss (if any)
-    function simulateLoss() public returns (uint256) {
-        uint256 assetsBefore = prizeVault.totalPreciseAssets();
-        _simulateLoss();
-        uint256 assetsAfter = prizeVault.totalPreciseAssets();
-        if (yieldVault.balanceOf(address(prizeVault)) > 0) {
-            // if the prize vault has any yield vault shares, check to ensure some loss has occurred
-            require(assetsAfter < assetsBefore, "loss not simulated");
-        } else {
-            if (underlyingAsset.balanceOf(address(prizeVault)) > 0) {
-                // the underlying asset might be rebasing in some setups, so it's possible time passing has caused an increase in latent balance
-                require(assetsAfter >= assetsBefore, "assets decreased while holding latent balance");
-                return 0;
-            } else {
-                // otherwise, we should expect no change on the prize vault
-                require(assetsAfter == assetsBefore, "assets changed with zero yield shares");
-            }
-        }
-        return assetsBefore - assetsAfter;
-    }
-
-    function checkIgnoreLoss() internal returns (bool) {
-        if (ignoreLoss) {
-            console2.log("skipping test since loss is ignored...");
-            return true;
-        }
-        return false;
-    }
-
-    /* ============ Integration Test Scenarios ============ */
-
-    //////////////////////////////////////////////////////////
-    /// Basic Asset Tests
-    //////////////////////////////////////////////////////////
-
-    /// @dev Tests if the asset meets a minimum precision per dollar (PPD). If the asset
-    /// is below this PPD, then it is possible that the yield buffer will not be able to sustain
-    /// the rounding errors that will accrue on deposits and withdrawals.
-    ///
-    /// Also passes if the yield buffer is zero (no buffer is needed if rounding errors are impossible).
-    function testAssetPrecisionMeetsMinimum() public {
-        if (yieldBuffer > 0) {
-            uint256 minimumPPD = 1e6; // USDC is the benchmark (6 decimals represent $1 of value)
-            uint256 assetPPD = (1e18 * (10 ** (assetDecimals - assetPrecisionLoss))) / approxAssetUsdExchangeRate;
-            assertGe(assetPPD, minimumPPD, "asset PPD > minimum PPD");
-        }
-    }
-
-    /// @notice Test if the attacker can cause rounding error loss on the prize vault by spending
-    /// less in gas than the rounding error loss will cost the vault.
-    ///
-    /// @dev This is an important measure to test since it's possible that some yield vaults can essentially
-    /// rounding errors to other holders of yield vault shares. If an attacker can cheaply cause repeated
-    /// rounding errors on the prize vault, they can potentially profit by being a majority shareholder on
-    /// the underlying yield vault.
-    function testAssetRoundingErrorManipulationCost() public {
-        uint256 costToManipulateInEth = lowGasPriceEstimate * lowGasEstimateForStateChange;
-        uint256 costToManipulateInUsd = (costToManipulateInEth * 1e18) / approxEthUsdExchangeRate;
-        uint256 costOfRoundingErrorInUsd = ((10 ** assetPrecisionLoss) * 1e18) / approxAssetUsdExchangeRate;
-        // 10x threshold is set so an attacker would have to spend at least 10x the loss they can cause on the prize vault.
-        uint256 multiplierThreshold = 10;
-        assertLt(costOfRoundingErrorInUsd * multiplierThreshold, costToManipulateInUsd, "attacker can cheaply cause rounding errors");
-    }
-
-    //////////////////////////////////////////////////////////
-    /// Deposit Tests
-    //////////////////////////////////////////////////////////
-
-    /// @notice test deposit
-    function testDeposit() public {
-        uint256 amount = 10 ** assetDecimals;
-        uint256 maxAmount = maxDeal() / 2;
-        if (amount > maxAmount) amount = maxAmount;
-        dealAssets(alice, amount);
-
-        uint256 totalAssetsBefore = prizeVault.totalPreciseAssets();
-        uint256 totalSupplyBefore = prizeVault.totalSupply();
-
-        startPrank(alice);
-        underlyingAsset.approve(address(prizeVault), amount);
-        prizeVault.deposit(amount, alice);
-        stopPrank();
-
-        uint256 totalAssetsAfter = prizeVault.totalPreciseAssets();
-        uint256 totalSupplyAfter = prizeVault.totalSupply();
-
-        assertEq(prizeVault.balanceOf(alice), amount, "shares minted");
-        assertApproxEqAbs(
-            totalAssetsBefore + amount,
-            totalAssetsAfter,
-            10 ** assetPrecisionLoss,
-            "assets accounted for with possible rounding error"
-        );
-        assertEq(totalSupplyBefore + amount, totalSupplyAfter, "supply increased by amount");
-    }
-
-    /// @notice test multi-user deposit
-    function testMultiDeposit() public {
-        address[] memory depositors = new address[](3);
-        depositors[0] = alice;
-        depositors[1] = bob;
-        depositors[2] = address(this);
-
-        for (uint256 i = 0; i < depositors.length; i++) {
-            uint256 amount = (10 ** assetDecimals) * (i + 1);
-            uint256 maxAmount = maxDeal() / 2;
-            if (amount > maxAmount) amount = maxAmount;
-            dealAssets(depositors[i], amount);
-
-            uint256 totalAssetsBefore = prizeVault.totalPreciseAssets();
-            uint256 totalSupplyBefore = prizeVault.totalSupply();
-
-            startPrank(depositors[i]);
-            underlyingAsset.approve(address(prizeVault), amount);
-            prizeVault.deposit(amount, depositors[i]);
-            stopPrank();
-
-            uint256 totalAssetsAfter = prizeVault.totalPreciseAssets();
-            uint256 totalSupplyAfter = prizeVault.totalSupply();
-
-            assertEq(prizeVault.balanceOf(depositors[i]), amount, "shares minted");
-            assertApproxEqAbs(
-                totalAssetsBefore + amount,
-                totalAssetsAfter,
-                10 ** assetPrecisionLoss,
-                "assets accounted for with possible rounding error"
-            );
-            assertEq(totalSupplyBefore + amount, totalSupplyAfter, "supply increased by amount");
-        }
-    }
-
-    /// @notice test multi-user deposit w/yield accrual in between
-    function testMultiDepositWithYieldAccrual() public {
-        if (checkIgnoreYield()) return;
-
-        address[] memory depositors = new address[](2);
-        depositors[0] = alice;
-        depositors[1] = bob;
-
-        for (uint256 i = 0; i < depositors.length; i++) {
-            uint256 amount = (10 ** assetDecimals) * (i + 1);
-            uint256 maxAmount = maxDeal() / 2;
-            if (amount > maxAmount) amount = maxAmount;
-            dealAssets(depositors[i], amount);
-
-            uint256 totalAssetsBefore = prizeVault.totalPreciseAssets();
-            uint256 totalSupplyBefore = prizeVault.totalSupply();
-
-            startPrank(depositors[i]);
-            underlyingAsset.approve(address(prizeVault), amount);
-            prizeVault.deposit(amount, depositors[i]);
-            stopPrank();
-
-            uint256 totalAssetsAfter = prizeVault.totalPreciseAssets();
-            uint256 totalSupplyAfter = prizeVault.totalSupply();
-
-            assertEq(prizeVault.balanceOf(depositors[i]), amount, "shares minted");
-            assertApproxEqAbs(
-                totalAssetsBefore + amount,
-                totalAssetsAfter,
-                10 ** assetPrecisionLoss,
-                "assets accounted for with possible rounding error"
-            );
-            assertEq(totalSupplyBefore + amount, totalSupplyAfter, "supply increased by amount");
-
-            if (i == 0) {
-                // accrue yield
-                accrueYield();
-            }
-        }
-    }
-
-    //////////////////////////////////////////////////////////
-    /// Withdrawal Tests
-    //////////////////////////////////////////////////////////
-
-    /// @notice test withdraw
-    /// @dev also tests for any active deposit / withdraw fees
-    function testWithdraw() public {
-        uint256 amount = 10 ** assetDecimals;
-        uint256 maxAmount = maxDeal() / 2;
-        if (amount > maxAmount) amount = maxAmount;
-        dealAssets(alice, amount);
-
-        uint256 totalAssetsBefore = prizeVault.totalPreciseAssets();
-        uint256 totalSupplyBefore = prizeVault.totalSupply();
-
-        startPrank(alice);
-        underlyingAsset.approve(address(prizeVault), amount);
-        prizeVault.deposit(amount, alice);
-        prizeVault.withdraw(amount, alice, alice);
-        stopPrank();
-
-        uint256 totalAssetsAfter = prizeVault.totalPreciseAssets();
-        uint256 totalSupplyAfter = prizeVault.totalSupply();
-
-        assertEq(prizeVault.balanceOf(alice), 0, "burns all user shares on full withdraw");
-        assertEq(underlyingAsset.balanceOf(alice), amount, "withdraws full amount of assets");
-        assertApproxEqAbs(
-            totalAssetsBefore,
-            totalAssetsAfter,
-            2 * 10 ** assetPrecisionLoss,
-            "no assets missing except for possible rounding error"
-        ); // 1 possible rounding error for deposit, 1 for withdraw
-        assertEq(totalSupplyBefore, totalSupplyAfter, "supply same as before");
-    }
-
-    /// @notice test withdraw with yield accrual
-    function testWithdrawWithYieldAccrual() public {
-        if (checkIgnoreYield()) return;
-
-        uint256 amount = 10 ** assetDecimals;
-        uint256 maxAmount = maxDeal() / 2;
-        if (amount > maxAmount) amount = maxAmount;
-        dealAssets(alice, amount);
-
-        uint256 totalAssetsBefore = prizeVault.totalPreciseAssets();
-        uint256 totalSupplyBefore = prizeVault.totalSupply();
-
-        startPrank(alice);
-        underlyingAsset.approve(address(prizeVault), amount);
-        prizeVault.deposit(amount, alice);
-        uint256 yield = accrueYield(); // accrue yield in between
-        prizeVault.withdraw(amount, alice, alice);
-        stopPrank();
-
-        uint256 totalAssetsAfter = prizeVault.totalPreciseAssets();
-        uint256 totalSupplyAfter = prizeVault.totalSupply();
-
-        assertEq(prizeVault.balanceOf(alice), 0, "burns all user shares on full withdraw");
-        assertEq(underlyingAsset.balanceOf(alice), amount, "withdraws full amount of assets");
-        assertApproxEqAbs(
-            totalAssetsBefore + yield,
-            totalAssetsAfter,
-            2 * 10 ** assetPrecisionLoss,
-            "no assets missing except for possible rounding error"
-        ); // 1 possible rounding error for deposit, 1 for withdraw
-        assertEq(totalSupplyBefore, totalSupplyAfter, "supply same as before");
-    }
-
-    /// @notice test all users withdraw
-    function testWithdrawAllUsers() public {
-        address[] memory depositors = new address[](3);
-        depositors[0] = alice;
-        depositors[1] = bob;
-        depositors[2] = address(this);
-
-        uint256[] memory amounts = new uint256[](3);
-
-        // deposit
-        for (uint256 i = 0; i < depositors.length; i++) {
-            uint256 amount = (10 ** assetDecimals) * (i + 1);
-            uint256 maxAmount = maxDeal() / 2;
-            if (amount > maxAmount) amount = maxAmount;
-            amounts[i] = amount;
-            dealAssets(depositors[i], amount);
-
-            startPrank(depositors[i]);
-            underlyingAsset.approve(address(prizeVault), amount);
-            prizeVault.deposit(amount, depositors[i]);
-            stopPrank();
-        }
-
-        // withdraw
-        for (uint256 i = 0; i < depositors.length; i++) {
-            uint256 totalAssetsBefore = prizeVault.totalPreciseAssets();
-            uint256 totalSupplyBefore = prizeVault.totalSupply();
-
-            startPrank(depositors[i]);
-            prizeVault.withdraw(amounts[i], depositors[i], depositors[i]);
-            stopPrank();
-
-            uint256 totalAssetsAfter = prizeVault.totalPreciseAssets();
-            uint256 totalSupplyAfter = prizeVault.totalSupply();
-
-            assertEq(prizeVault.balanceOf(depositors[i]), 0, "burned all user's shares on withdraw");
-            assertEq(underlyingAsset.balanceOf(depositors[i]), amounts[i], "withdrew full asset amount for user");
-            assertApproxEqAbs(
-                totalAssetsBefore,
-                totalAssetsAfter + amounts[i],
-                10 ** assetPrecisionLoss,
-                "assets accounted for with no more than 1 wei rounding error"
-            );
-            assertEq(totalSupplyBefore - amounts[i], totalSupplyAfter, "total supply decreased by amount");
-        }
-    }
-
-    /// @notice test all users withdraw during lossy state
-    function testWithdrawAllUsersWhileLossy() public {
-        if (checkIgnoreLoss()) return;
-
-        address[] memory depositors = new address[](3);
-        depositors[0] = alice;
-        depositors[1] = bob;
-        depositors[2] = address(this);
-
-        // deposit
-        for (uint256 i = 0; i < depositors.length; i++) {
-            uint256 amount = (10 ** assetDecimals) * (i + 1);
-            uint256 maxAmount = maxDeal() / 2;
-            if (amount > maxAmount) amount = maxAmount;
-            dealAssets(depositors[i], amount);
-
-            startPrank(depositors[i]);
-            underlyingAsset.approve(address(prizeVault), amount);
-            prizeVault.deposit(amount, depositors[i]);
-            stopPrank();
-        }
-
-        // cause loss on the yield vault
-        simulateLoss();
-
-        // ensure prize vault is in lossy state
-        assertLt(prizeVault.totalPreciseAssets(), prizeVault.totalDebt());
-
-        // verify all users can withdraw a proportional amount of assets
-        for (uint256 i = 0; i < depositors.length; i++) {
-            uint256 shares = prizeVault.balanceOf(depositors[i]);
-            uint256 totalAssetsBefore = prizeVault.totalPreciseAssets();
-            uint256 totalSupplyBefore = prizeVault.totalSupply();
-            uint256 totalDebtBefore = prizeVault.totalDebt();
-            uint256 expectedAssets = (shares * totalAssetsBefore) / totalDebtBefore;
-
-            startPrank(depositors[i]);
-            uint256 assets = prizeVault.redeem(shares, depositors[i], depositors[i]);
-            stopPrank();
-
-            uint256 totalAssetsAfter = prizeVault.totalPreciseAssets();
-            uint256 totalSupplyAfter = prizeVault.totalSupply();
-
-            assertEq(assets, expectedAssets, "assets received proportional to shares / totalDebt");
-            assertEq(prizeVault.balanceOf(depositors[i]), 0, "burned all user's shares on withdraw");
-            assertEq(underlyingAsset.balanceOf(depositors[i]), assets, "withdrew assets for user");
-            assertApproxEqAbs(
-                totalAssetsBefore,
-                totalAssetsAfter + assets,
-                10 ** assetPrecisionLoss,
-                "assets accounted for with no more than 1 wei rounding error"
-            );
-            assertEq(totalSupplyBefore - shares, totalSupplyAfter, "total supply decreased by shares");
-        }
-    }
-
-    /// @notice test liquidation of assets
-    function testAssetLiquidation() public {
-        if (checkIgnoreYield()) return;
-
-        // Deposit
-        uint256 amount = 1000 * (10 ** assetDecimals);
-        uint256 maxAmount = maxDeal() / 2;
-        if (amount > maxAmount) amount = maxAmount;
-        dealAssets(alice, amount);
-
-        startPrank(alice);
-        underlyingAsset.approve(address(prizeVault), amount);
-        prizeVault.deposit(amount, alice);
-        stopPrank();
-
-        // Yield Accrual
-        uint256 approxYield = accrueYield();
-        uint256 availableYield = prizeVault.availableYieldBalance();
-        assertApproxEqAbs(
-            approxYield,
-            availableYield,
-            10 ** assetPrecisionLoss,
-            "approx yield equals available yield balance"
-        );
-        uint256 availableAssets = prizeVault.liquidatableBalanceOf(address(underlyingAsset));
-        assertGt(availableAssets, 0, "assets are available for liquidation");
-        
-        // Liquidate
-        prizeVault.transferTokensOut(address(0), bob, address(underlyingAsset), availableAssets);
-        assertEq(underlyingAsset.balanceOf(bob), availableAssets, "liquidator is transferred expected assets");
-        assertApproxEqAbs(prizeVault.availableYieldBalance(), availableYield - availableAssets, 10 ** assetPrecisionLoss, "available yield decreased (w / 1 wei rounding error)");
-        assertApproxEqAbs(prizeVault.liquidatableBalanceOf(address(underlyingAsset)), 0, 10 ** assetPrecisionLoss, "no more assets can be liquidated (w/ 1 wei rounding error)");
-    }
-
-    /// @notice test liquidatable balance of when lossy
-    function testNoLiquidationWhenLossy() public {
-        if (checkIgnoreYield() || checkIgnoreLoss()) return;
-
-        // Deposit
-        uint256 amount = 1000 * (10 ** assetDecimals);
-        uint256 maxAmount = maxDeal() / 2;
-        if (amount > maxAmount) amount = maxAmount;
-        dealAssets(alice, amount);
-
-        startPrank(alice);
-        underlyingAsset.approve(address(prizeVault), amount);
-        prizeVault.deposit(amount, alice);
-        stopPrank();
-
-        // Yield Accrual
-        uint256 approxYield = accrueYield();
-        uint256 availableYield = prizeVault.availableYieldBalance();
-        assertApproxEqAbs(
-            approxYield,
-            availableYield,
-            10 ** assetPrecisionLoss,
-            "approx yield equals available yield balance"
-        );
-        uint256 availableAssets = prizeVault.liquidatableBalanceOf(address(underlyingAsset));
-        assertGt(availableAssets, 0, "assets are available for liquidation");
-        uint256 availableShares = prizeVault.liquidatableBalanceOf(address(prizeVault));
-        assertGt(availableShares, 0, "shares are available for liquidation");
-
-        // Loss Occurs
-        simulateLoss();
-
-        // No liquidations can occur if assets < debt
-        availableYield = prizeVault.availableYieldBalance();
-        assertEq(availableYield, 0, "no available yield after loss");
-        availableAssets = prizeVault.liquidatableBalanceOf(address(underlyingAsset));
-        assertEq(availableAssets, 0, "no available asset liquidation after loss");
-        availableShares = prizeVault.liquidatableBalanceOf(address(prizeVault));
-        assertEq(availableShares, 0, "no available share liquidation after loss");
-    }
-    
-}
-
-```
-</details>
-
-Now add the following `BackrunWithdrawWithHugelyProfitableLiquidationPOC.sol` to /2024-05-pooltogether/pt-v5-vault/test/integration/BackrunWithdrawWithHugelyProfitableLiquidationPOC.sol
-
-The following foundry test test__BackrunWithdrawWithHugelyProfitableLiquidationPOC() illustrates the attack scenario.
-
-Run it with the following command line input
-
-```terminal
-forge test --mt test__BackrunWithdrawWithHugelyProfitableLiquidationPOC -vv
-```
-
-```solidity
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
-
-import { Test } from "forge-std/Test.sol";
-import { console } from "forge-std/console.sol";
-import { BaseIntegration } from "./BaseIntegration.t.sol";
-
-
-
-import { IERC20, IERC4626 } from "openzeppelin/token/ERC20/extensions/ERC4626.sol";
-
-import { PrizePool } from "pt-v5-prize-pool/PrizePool.sol";
-import { TwabController } from "pt-v5-twab-controller/TwabController.sol";
-
-import { ERC20PermitMock } from "../contracts/mock/ERC20PermitMock.sol";
-import { PrizePoolMock } from "../contracts/mock/PrizePoolMock.sol";
-import { Permit } from "../contracts/utility/Permit.sol";
-
-import { PrizeVaultWrapper, PrizeVault } from "../contracts/wrapper/PrizeVaultWrapper.sol";
-
-import { YieldVault } from "../contracts/mock/YieldVault.sol";
-
-contract BackrunWithdrawWithHugelyProfitableLiquidationPOC is Test, BaseIntegration {
-    function setUp() override public {
-        super.setUp();
-
-
-        // Setup users
-        underlyingAsset.mint(alice, type(uint128).max);
-        vm.startPrank(alice);
-        underlyingAsset.approve(address(prizeVault), type(uint128).max);
-
-        underlyingAsset.mint(bob, type(uint128).max);
-        vm.startPrank(bob);
-        underlyingAsset.approve(address(prizeVault), type(uint128).max);
-
-        underlyingAsset.mint(attacker, type(uint128).max);
-        vm.startPrank(attacker);
-        underlyingAsset.approve(address(prizeVault), type(uint128).max);
-    }
-
-    function setUpUnderlyingAsset() public override returns (IERC20 asset, uint8 decimals, uint256 approxAssetUsdExchangeRate) {}
-
-    function setUpFork() public override {}
-
-    function beforeSetup() public override {}
-
-    function afterSetup() public override {}
-
-    /* ============ helpers to override ============ */
-
-    /// @dev The max amount of assets than can be dealt.
-    function maxDeal() public override returns (uint256) {}
-
-    /// @dev May revert if the amount requested exceeds the amount available to deal.
-    function dealAssets(address to, uint256 amount) public override {}
-
-    /// @dev Some yield sources accrue by time, so it's difficult to accrue an exact amount. Call the 
-    /// function multiple times if the test requires the accrual of more yield than the default amount.
-    function _accrueYield() internal override {
-        vm.startPrank(alice);
-        IERC20(underlyingAsset).transfer(address(yieldVault), 10000000);
-    }
-
-    /// @dev Simulates loss on the yield vault such that the value of it's shares drops
-    function _simulateLoss() internal override {}
-
-
-
-
-
-
-    function test__BackrunWithdrawWithHugelyProfitableLiquidationPOC() public {
-        // This is to represent thousands of users depositing over time
-        vm.startPrank(alice);
-        prizeVault.deposit(79228162514264337593443950335, alice);
-
-        // This represents the liquidator depositing in the vault at some point
-        vm.startPrank(attacker);
-        prizeVault.deposit(100000000, attacker);
-
-        // Yield accrual
-        _accrueYield();
-
-        vm.stopPrank();
-
-        // Honest liquidator sees the yield accrue and sends a Tx to liquidate it, but it will revert
-        uint256 availableAssets = prizeVault.liquidatableBalanceOf(address(underlyingAsset));
-        console.log("availableAssets to liquidate =", availableAssets);
-
-        vm.expectRevert();
-        prizeVault.transferTokensOut(address(0), bob, address(underlyingAsset), availableAssets);
-
-        // Attacker waits a few days so that elapsed time accumulates
-        skip(3 days);
-
-        // Attacker withdraws their deposit
-        vm.startPrank(attacker);
-        prizeVault.withdraw(prizeVault.balanceOf(attacker), attacker, attacker);
-
-        vm.stopPrank();
-
-        // Attacker backruns the withdraw with a liquidation at a much lower price since so much time passed
-        prizeVault.transferTokensOut(address(0), bob, address(underlyingAsset), availableAssets);
-    }
-}
-```
-
-Console Output
-
-```terminal
-Ran 1 test for test/integration/BackrunWithdrawWithHugelyProfitableLiquidationPOC.sol:BackrunWithdrawWithHugelyProfitableLiquidationPOC
-[PASS] test__BackrunWithdrawWithHugelyProfitableLiquidationPOC() (gas: 597935)
-Logs:
-  availableAssets to liquidate = 989999
-
-Suite result: ok. 1 passed; 0 failed; 0 skipped; finished in 2.15ms (798.19µs CPU time)
-
-Ran 1 test suite in 13.31ms (2.15ms CPU time): 1 tests passed, 0 failed, 0 skipped (1 total tests)
-```
-## Code Snippet
-https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-vault/src/PrizeVault.sol#L744-L750
-
-## Tool used
-
-Manual Review
-
-## Recommendation
-This will require a complex solution to prevent introducing other vulnerabilities, possibly redesigning the mint limit
-
-
-
-## Discussion
-
-**nevillehuang**
-
-Same root cause for all issues and duplicates highlighted, that is a TWAB_SUPPLY_LIMIT must be triggered via large deposits, a potential fix would be to support a higher TWAB_SUPPLY_LIMIT
-
-# Issue H-2: Vault portion calculation in `PrizePool::getVaultPortion()` is incorrect as `_startDrawIdInclusive` has been erased 
+# Issue H-1: Vault portion calculation in `PrizePool::getVaultPortion()` is incorrect as `_startDrawIdInclusive` has been erased 
 
 Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/96 
 
@@ -908,7 +50,17 @@ Vscode
 
 When calculating `PrizePool::computeRangeStartDrawIdInclusive()`, the `rangeSize` should be capped to `365` to ensure the right `startDrawIdInclusive` is fetched, not one that has already been erased. In the scenario above, if the range is capped at 365, when `lastAwardedDrawId_ == 366`, `startDrawIdInclusive` would be `366 - 365 + 1 == 2`, which has not been erased as the current `drawId` is `367`, having only overwritten `drawId == 1`, but 2 still has the information. 
 
-# Issue H-3: Draw auction rewards likely exceed the available rewards, resulting in overpaying rewards or running into an `InsufficientReserve` error 
+
+
+## Discussion
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/GenerationSoftware/pt-v5-prize-pool/pull/115
+
+
+# Issue H-2: Draw auction rewards likely exceed the available rewards, resulting in overpaying rewards or running into an `InsufficientReserve` error 
 
 Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/125 
 
@@ -1032,61 +184,16 @@ The only difference is the amount of time that a benevolent actor has to push th
 
 Was this behavior documented as expected behavior? If not I would lean towards agreeing that high severity is appropriate. 
 
-# Issue M-1: `DrawManager.startDraw()` can be called after prize pool shutdown, even though `finishDraw()` always reverts 
+**trmid**
 
-Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/26 
+A severity of `high` seems inappropriate for this issue.
 
-## Found by 
-MiloTruck, trachev
-## Summary
+The prize pool uses part of the yield generation (the reserve) to incentivize the RNG auctions. If the generated value is insufficient for a draw to be awarded, then the [prize pool keeps *all* the prize liquidity for the draw and includes it in the next draw](https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-prize-pool/src/PrizePool.sol#L474). The issue mentioned here is not something that can be forced or exploited, rather it is describing a better way to handle the auction pricing when there is less yield than required to incentivize the RNG. The only difference between the current behaviour and the suggested mitigation behaviour is that the auction will be available for a longer period of time when it does not have proper liquidity for a profitable payout.
 
-After the prize pool is shutdown, `startDraw()` can still be called even though `finishDraw()` will always revert. This causes a loss of funds for draw bots that do so as draw rewards are never paid out.
+This issue is assuming that there are not enough incentives for the RNG auctions to provide profitable payouts, therefore `medium` seems more appropriate:
+> Causes a loss of funds but requires certain external conditions or specific states, or a loss is highly constrained. The losses must exceed small, finite amount of funds, and any amount relevant based on the precision or significance of the loss.
 
-## Vulnerability Detail
-
-`PrizePool.awardDraw()` has the `notShutdown` modifier, which means that it cannot be called once `block.timestamp` exceeds [`shutdownAt()`](https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-prize-pool/src/PrizePool.sol#L957-L963):
-
-[PrizePool.sol#L455](https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-prize-pool/src/PrizePool.sol#L455)
-
-```solidity
-  function awardDraw(uint256 winningRandomNumber_) external onlyDrawManager notShutdown returns (uint24) {
-```
-
-However, `DrawManager.startDraw()` does not check if the prize pool has been shutdown. The only time-based condition in `startDraw()` is whether the current `drawId` to award has closed:
-
-[DrawManager.sol#L222-L224](https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-draw-manager/src/DrawManager.sol#L222-L224)
-
-```solidity
-    uint24 drawId = prizePool.getDrawIdToAward(); 
-    uint48 closesAt = prizePool.drawClosesAt(drawId);
-    if (closesAt > block.timestamp) revert DrawHasNotClosed();
-```
-
-As such, it is possible for draw bots to call `startDraw()` after the pool has shutdown, even though it is no longer possible to call `finishDraw()` since `PrizePool.awardDraw()` will revert.
-
-When draw bots call `startDraw()` to start awarding a draw, they pay gas costs + the RNG fee for requesting randomness. As such, when `startDraw()` is called after the pool is shutdown, draw bots will never be refunded for gas costs + the RNG fee as draw rewards are paid in `finishDraw()`.
-
-## Impact
-
-When draw bots call `startDraw()` after the prize pool is shutdown, they experience a loss of funds as `finishDraw()` cannot be called, so draw rewards are never paid out to cover the cost of calling `startDraw()`.
-
-Note that the likelihood of this happening is not low - draw bots will most likely call [`canStartDraw()`](https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-draw-manager/src/DrawManager.sol#L275-L291), which also does not check if the prize pool has shutdown, to determine if they should call `startDraw()`.
-
-## Code Snippet
-
-https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-prize-pool/src/PrizePool.sol#L455
-
-https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-draw-manager/src/DrawManager.sol#L222-L224
-
-## Tool used
-
-Manual Review
-
-## Recommendation
-
-In `startDraw()`, consider checking if `block.timestamp` is greater than [`shutdownAt()`](https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-prize-pool/src/PrizePool.sol#L957-L963) and reverting if so.
-
-# Issue M-2: Draws can be retried even if a random number is available or the current draw has finished 
+# Issue M-1: Draws can be retried even if a random number is available or the current draw has finished 
 
 Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/27 
 
@@ -1190,7 +297,86 @@ In `startDraw()`, consider checking `isRequestComplete()` to know if a random nu
         revert AlreadyStartedDraw();
 ```
 
-# Issue M-3: `drawTimeoutAt()` causes the prize pool to shutdown one draw earlier 
+
+
+## Discussion
+
+**10xhash**
+
+Escalate
+
+Here we are speculating on the behavior of the bots which I believe would be out of scope. The bot would have to call the startDraw function even when the draw has finished or in an edge case (later rng request being reported earlier and earlier being reported ERROR) the bot would have the option to either call startDraw or call finishDraw
+
+The recommendation is incorrect because it would allow all new requests to be overwritten. The current implementation is done with the assumption that witnet requests will be reported sequentially (which would be the case most of the time). In which case, as soon as the request results in an ERROR, the draw awarding can be reattempted. In case it doesn't happen sequentially and this request returns ERROR while the newer request returns a correct value, there is the option to either restart the draw or finish the draw and it would be depending on the bot's implementation which of these is performed
+
+**sherlock-admin3**
+
+> Escalate
+> 
+> Here we are speculating on the behavior of the bots which I believe would be out of scope. The bot would have to call the startDraw function even when the draw has finished or in an edge case (later rng request being reported earlier and earlier being reported ERROR) the bot would have the option to either call startDraw or call finishDraw
+> 
+> The recommendation is incorrect because it would allow all new requests to be overwritten. The current implementation is done with the assumption that witnet requests will be reported sequentially (which would be the case most of the time). In which case, as soon as the request results in an ERROR, the draw awarding can be reattempted. In case it doesn't happen sequentially and this request returns ERROR while the newer request returns a correct value, there is the option to either restart the draw or finish the draw and it would be depending on the bot's implementation which of these is performed
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**MiloTruck**
+
+> In case it doesn't happen sequentially and this request returns ERROR while the newer request returns a correct value, there is the option to either restart the draw or finish the draw and it would be depending on the bot's implementation which of these is performed
+
+The current implementation allows for the following to occur:
+
+- Bot calls `startDraw()` with the first request.
+- First request returns ERROR.
+- Second request returns a correct value.
+- Bot calls `startDraw()` to restart the draw.
+- Attacker front-runs the bot to call `finishDraw()`.
+- Bot's call to `startDraw()` still executes and passes, causing it to have called `startDraw()` after `finishDraw()`.
+
+There is no requirement for a bot to act abnormally here, it chooses the restart the draw as you have stated and ends up losing funds.
+
+Even if the impacts/scenarios listed in my issue can only occur under an edge case or with bots behaving in a certain manner, I don't believe it is an acceptable risk for bots to potentially lose funds just by interacting with the protocol.
+
+**WangSecurity**
+
+To confirm:
+
+> For example, assume there are two requests:
+
+Request 1 made at block.number = 100 failed.
+Request 2 made at block.number = 101 was successful.
+If isRandomized() and fetchRandomnessAfter() was called for block number 100, they would return true and a valid random number respectively. By extension, RngWitnet.isRequestComplete() would return true for request 1. However, RngWitnet.isRequestFailed() also returns true for request 1, forming a contradiction.
+
+
+Even if the request failed, `isRandomized`, `fetchRandomnessAfter` and `RngWitnet.isRequestComplete` would return true as if the request didn't fail. And `RngWitnet.isRequestFailed` would also return true, because it's not correctly implemented (the root cause), could you please clarify this part briefly again, I feel like I'm missing something?
+
+**MiloTruck**
+
+@WangSecurity I'm not really sure what you don't understand.
+
+`isRandomized()` checks if there is a successful request at a specific block or any block after it, while `isRequestFailed()` only checks if the request at a specific block failed. So in this scenario `isRandomized()` returns `true` for block 100 since a block after it contains a successful request (ie. request 2 at block 101), while `isRequestFailed()` returns `false` as request 1 at block 100 failed.
+
+**WangSecurity**
+
+Thank you for clarification, based on this and [that](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/27#issuecomment-2182171801), I believe it doesn't require for the bots to can in any strange way and it doesn't require any mistake on their end. Planning to reject the escalation and leave the issue as it is.
+
+**WangSecurity**
+
+Result:
+Medium
+Unique
+
+**sherlock-admin4**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [10xhash](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/27/#issuecomment-2181077675): rejected
+
+# Issue M-2: `drawTimeoutAt()` causes the prize pool to shutdown one draw earlier 
 
 Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/28 
 
@@ -1277,116 +463,107 @@ Modify `drawTimeoutAt()` to return the close time of `_lastAwardedDrawId + drawT
   }
 ```
 
-# Issue M-4: Distributing liquidity based on the last `grandPrizePeriodDraws` days post-shutdown is problematic 
-
-Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/36 
-
-The protocol has acknowledged this issue.
-
-## Found by 
-MiloTruck, trachev, volodya
-## Summary
-
-After a prize pool shuts down, its funds are distributed based on draws before it shut down. This could cause a loss of funds for prize pools that contribute new liquidity to the pool post-shutdown.
-
-## Vulnerability Detail
-
-After a vault is shutdown, all existing and new liquidity is distributed based on a user and vault's time-weighted prize contribution during the last `grandPrizePeriodDraws` before shutdown:
-
-[PrizePool.sol#L873-L895](https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-prize-pool/src/PrizePool.sol#L873-L895)
-
-```solidity
-  function computeShutdownPortion(address _vault, address _account) public view returns (ShutdownPortion memory) {
-    uint24 drawIdPriorToShutdown = getShutdownDrawId() - 1;
-    uint24 startDrawIdInclusive = computeRangeStartDrawIdInclusive(drawIdPriorToShutdown, grandPrizePeriodDraws);
-
-    (uint256 vaultContrib, uint256 totalContrib) = _getVaultShares(
-      _vault,
-      startDrawIdInclusive,
-      drawIdPriorToShutdown
-    );
-
-    (uint256 _userTwab, uint256 _vaultTwabTotalSupply) = getVaultUserBalanceAndTotalSupplyTwab(
-      _vault,
-      _account,
-      startDrawIdInclusive,
-      drawIdPriorToShutdown
-    );
-
-    if (_vaultTwabTotalSupply == 0) {
-      return ShutdownPortion(0, 0);
-    }
-
-    return ShutdownPortion(vaultContrib * _userTwab, totalContrib * _vaultTwabTotalSupply);
-  }
-```
-
-As seen from above, the draw ID used as the ending draw is `getShutdownDrawId() - 1`, which is the draw before the pool shut down.
-
-However, this method of allocating liquidity is problematic when considering that new liquidity can be contributed to the prize pool, even after it is shutdown.
-
-Firstly, if a vault shuts down before any liquidity is contributed through `contributePrizeTokens()`, all future liquidity contributed to the prize pool will be permanently stuck. For example:
-
-- A prize pool and vault are newly deployed.
-- Assume that `drawTimeout = 1`, which means the prize pool shuts down after one draw is missed.
-- In the first draw period, the prize pool does not generate any yield, and therefore, it does not contribute any liquidity.
-- The first draw is missed as there is no prize liquidity, so the pool shuts down.
-- In the second draw period, the prize pool generates some yield and calls `contributePrizeTokens()` to add it to the prize pool.
-- When users of the vault attempt to withdraw the yield from the prize pool through `withdrawShutdownBalance()`:
-  - In `computeShutdownPortion()`, `totalContrib = 0` as no liquidity was contributed before the pool shut down.
-  - In `shutdownBalanceOf()`, `shutdownPortion.denominator = 0`, so the withdrawable balance for all users is `0`.
-- As such, since all users cannot withdraw any balance from the prize pool, the new prize liquidity is effectively stuck forever.
-
-Secondly, prize pools that did not contribute any liquidity before the pool shut down, but start doing so post-shutdown will always lose their yield. For example:
-- Assume two vaults are deployed, called vault A and B.
-- Before the pool shuts down:
-  - Vault A calls `contributePrizeTokens()` and contributes some prize liquidity.
-  - Vault B does not generate any yield, so it does not contribute any prize liquidity.
-- After the pool shuts down, vault B starts generating yield and consistently calls `contributePrizeTokens()`.
-- However, since vault B did not contribute any liquidity before the pool shut down, all contributions from vault B are only withdrawable by users of vault A.
-- This causes a loss of yield for users in vault B.
-
-Note that since vaults call `contributePrizeTokens()` without checking if the pool has shut down and the liquidation of yield is performed automatically by liquidation bots, it is not unlikely for a vault to contribute liquidity to a pool after it is shut down.
-
-## Impact
-
-When a vault contributes to the prize pool post-shutdown but did not do so before shutdown, all users of the vault lose their yield, causing a loss of funds.
-
-In the case where the prize pool did not receive any liquidity before shutdown, all funds contributed post-shutdown will be permanently stuck in the pool, causing a loss of yield for all users.
-
-## Code Snippet
-
-## Tool used
-
-Manual Review
-
-## Recommendation
-
-Consider a different method of allocating funds in the prize pool after shutdown. For example, the ending draw in `computeShutdownPortion()` could include the latest draw.
-
 
 
 ## Discussion
 
-**trmid**
+**0xjuaan**
 
-The prize pool can enter shutdown mode for two reasons:
+Escalate
 
-1. the draw timeout has been reached due to the termination of the RNG service
-2. the TWAB timestamps have reached their max limit
+This issue should be low severity
 
-The second is guaranteed to happen at the end of life for a TWAB controller and was a major consideration in the design of the shutdown logic. With this consideration in mind, the computed shutdown balances cannot look at TWAB past the shutdown timestamp, and therefore must use past TWAB to allocate balances on a best-effort basis. While the shutdown allocations can be unfair to edge cases, it provides simple rules for distributions that consider the historical weight of a vault's contributions while remaining within the limitations of a shutdown environment.
+The impact of this issue is that the prizePool will shutdown 1 draw earlier
 
-The shutdown logic is not designed to support contributions from new vaults that have never contributed before. It's a bit like trying to open an account at an institution that just declared bankruptcy. While it may not be ideal for everyone, prize vault owners that don't like the shutdown distribution can change the liquidation strategy on the vault to redirect any yield to a different distribution system.
+This means that instead of shutting down 81 years later, the protocol will shutdown (81 years - 1 day) later. 
 
-# Issue M-5: Price formula in `TpdaLiquidationPair._computePrice()` does not account for a jump in liquidatable balance 
+Firstly the issue will only come into play around shutdown which is more than 81 years later. This amount of time is too large for the issue to be above low severity. For example, overflow when casting block.timestamp to uint32 has always been considered low, since the impact occurs in 82 years.
+
+Secondly the fact that. the protocol shuts down 1 day earlier means that the protocol will shutdown 0.003% earlier. This is too small to be considered a medium severity issue. 
+
+**sherlock-admin3**
+
+> Escalate
+> 
+> This issue should be low severity
+> 
+> The impact of this issue is that the prizePool will shutdown 1 draw earlier
+> 
+> This means that instead of shutting down 81 years later, the protocol will shutdown (81 years - 1 day) later. 
+> 
+> Firstly the issue will only come into play around shutdown which is more than 81 years later. This amount of time is too large for the issue to be above low severity. For example, overflow when casting block.timestamp to uint32 has always been considered low, since the impact occurs in 82 years.
+> 
+> Secondly the fact that. the protocol shuts down 1 day earlier means that the protocol will shutdown 0.003% earlier. This is too small to be considered a medium severity issue. 
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**MiloTruck**
+
+> This means that instead of shutting down 81 years later, the protocol will shutdown (81 years - 1 day) later.
+>
+> Firstly the issue will only come into play around shutdown which is more than 81 years later. This amount of time is too large for the issue to be above low severity. For example, overflow when casting block.timestamp to uint32 has always been considered low, since the impact occurs in 82 years.
+>
+> Secondly the fact that. the protocol shuts down 1 day earlier means that the protocol will shutdown 0.003% earlier. This is too small to be considered a medium severity issue.
+
+The prize pool will also shutdown one draw earlier than intended when consecutive draws are not awarded. If `drawTimeout = 2`, the pool will shutdown after one draw has been missed, instead of two as intended. I've literally written this in my issue...
+
+**0xspearmint1**
+
+(The escalation was on my behalf)
+
+The following is from the test suite
+
+```solidity
+uint24 grandPrizePeriodDraws = 365;
+uint48 drawPeriodSeconds = 1 days;
+uint24 drawTimeout; // = grandPrizePeriodDraws * drawPeriodSeconds; // 1000 days;
+```
+
+The scenario of having 365 consecutive days without a single prize awarded is not realistic...
+
+Even if this did happen, the protocol will shutdown in 364 days instead of 365. The impact of shutting down 1 day earlier in such an extreme scenario is not medium severity.
+
+Low severity is appropriate.
+
+**nevillehuang**
+
+Agree with @MiloTruck comments [here](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/28#issuecomment-2180518977). Even a single early shutdown would mean the prize pool will never award prizes to any vaults and will immediately shut down, leading to a loss of yield for depositors for that specific draw. Medium severity is appropriate
+
+**WangSecurity**
+
+Based on the Lead Judge's comment above, I believe Medium severity is appropriate here. Planning to reject the escalation and leave the issue as it is.
+
+**WangSecurity**
+
+Result:
+Medium 
+Has duplicates
+
+**sherlock-admin4**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [0xjuaan](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/28/#issuecomment-2180283188): rejected
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/GenerationSoftware/pt-v5-prize-pool/pull/117
+
+
+# Issue M-3: Price formula in `TpdaLiquidationPair._computePrice()` does not account for a jump in liquidatable balance 
 
 Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/38 
 
 The protocol has acknowledged this issue.
 
 ## Found by 
-0x73696d616f, MiloTruck
+0x73696d616f, 0xSpearmint1, MiloTruck
 ## Summary
 
 The linearly decreasing auction formula in `TpdaLiquidationPair._computePrice()` does not account for sudden increases in the vault's liquidatable balance, causing the price returned to be much lower than it should be.
@@ -1507,11 +684,262 @@ If the yield source is expected to have large jumps in yield (by design or by th
 1. set a suitable `smoothingFactor` on the liquidation pair to mitigate the effect within a reasonable efficiency target
 2. pause liquidations during times of anticipated flux and set a new liquidation pair when ready (this would be good practice if suddenly lowering the yield fee percentage).
 
-# Issue M-6: The claimer's fee will be stolen by the winner 
+**0xjuaan**
 
-Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/73 
+Escalate
+
+This issue should be informational
+
+This is clearly a design decision by the protocol
+
+The sponsor has also suggested some ways the prizeVault owner can mitigate this in the vault setup
+
+Even if there is the odd upward fluctuation of yield the current design of the auction system ensures it will correct itself for future liquidations
+
+**sherlock-admin3**
+
+> Escalate
+> 
+> This issue should be informational
+> 
+> This is clearly a design decision by the protocol
+> 
+> The sponsor has also suggested some ways the prizeVault owner can mitigate this in the vault setup
+> 
+> Even if there is the odd upward fluctuation of yield the current design of the auction system ensures it will correct itself for future liquidations
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**MiloTruck**
+
+> This is clearly a design decision by the protocol
+>
+> The sponsor has also suggested some ways the prizeVault owner can mitigate this in the vault setup
+
+I don't see how the auction mechanism being a design decision invalidates this issue. I've clearly pointed out how this design decision is incapable of handling upward yield fluctuations, which is an actual problem.
+
+The sponsor has pointed out ways which, in my opinion, only _partially_ mitigate the problem presented. The owner has to either has to temporarily stop liquidations or reduce the percentage of yield that can be liquidated to smooth out the upward fluctuation. Note that both ways are a form of owner intervention, and I don't believe it is documented anywhere on how the owner should deal with upward yield fluctuations.
+
+> Even if there is the odd upward fluctuation of yield the current design of the auction system ensures it will correct itself for future liquidations
+
+The prize vault still loses funds for the current liquidation, so this doesn't invalidate anything.
+
+**nevillehuang**
+
+Agree with @MiloTruck comments.
+
+**WangSecurity**
+
+As the report says, the issue may cause loss of funds to users, hence, I believe design decision rule is not appropriate here. Planning to reject the escalation and leave the issue as it is.
+
+**WangSecurity**
+
+Result:
+Medium
+Has duplicates
+
+**sherlock-admin4**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [0xjuaan](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/38/#issuecomment-2180287305): rejected
+
+# Issue M-4: `TpdaLiquidationPair.swapExactAmountOut()` can be DOSed by a vault's mint limit 
+
+Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/39 
 
 The protocol has acknowledged this issue.
+
+## Found by 
+0xSpearmint1, MiloTruck
+## Summary
+
+By repeatedly DOSing `TpdaLiquidationPair.swapExactAmountOut()` for a period of time, an attacker can swap the liquidatable balancce in a vault for profit.
+
+## Vulnerability Detail
+
+When liquidation bots call `TpdaLiquidationPair.swapExactAmountOut()`, they specify the amount of tokens they wish to receive in `_amountOut`. `_amountOut` is then checked against the available balance to swap from the vault:
+
+[TpdaLiquidationPair.sol#L141-L144](https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-tpda-liquidator/src/TpdaLiquidationPair.sol#L141-L144)
+
+```solidity
+        uint256 availableOut = _availableBalance();
+        if (_amountOut > availableOut) {
+            revert InsufficientBalance(_amountOut, availableOut);
+        }
+```
+
+The available balance to swap is determined by the liquidatable balance of the vault:
+ 
+[TpdaLiquidationPair.sol#L184-L186](https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-tpda-liquidator/src/TpdaLiquidationPair.sol#L184-L186)
+
+```solidity
+    function _availableBalance() internal returns (uint256) {
+        return ((1e18 - smoothingFactor) * source.liquidatableBalanceOf(address(_tokenOut))) / 1e18;
+    }
+```
+
+However, when the output token from the swap (ie. `tokenOut`) is vault shares, `PrizeVault.liquidatableBalanceOf()` is restricted by the mint limit:
+
+[PrizeVault.sol#L687-L709](https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-vault/src/PrizeVault.sol#L687-L709)
+
+```solidity
+    function liquidatableBalanceOf(address _tokenOut) external view returns (uint256) {
+        uint256 _totalDebt = totalDebt();
+        uint256 _maxAmountOut;
+        if (_tokenOut == address(this)) {
+            // Liquidation of vault shares is capped to the mint limit.
+            _maxAmountOut = _mintLimit(_totalDebt);
+        } else if (_tokenOut == address(_asset)) {
+            // Liquidation of yield assets is capped at the max yield vault withdraw plus any latent balance.
+            _maxAmountOut = _maxYieldVaultWithdraw() + _asset.balanceOf(address(this));
+        } else {
+            return 0;
+        }
+
+        // The liquid yield is limited by the max that can be minted or withdrawn, depending on
+        // `_tokenOut`.
+        uint256 _availableYield = _availableYieldBalance(totalPreciseAssets(), _totalDebt);
+        uint256 _liquidYield = _availableYield >= _maxAmountOut ? _maxAmountOut : _availableYield;
+
+        // The final balance is computed by taking the liquid yield and multiplying it by
+        // (1 - yieldFeePercentage), rounding down, to ensure that enough yield is left for
+        // the yield fee.
+        return _liquidYield.mulDiv(FEE_PRECISION - yieldFeePercentage, FEE_PRECISION);
+    }
+```
+
+This means that if the amount of shares minted is close to `type(uint96).max`, the available balance in the vault (ie. `_liquidYield`) will be restricted by the remaining number of shares that can be minted.
+
+However, an attacker can take advantage of this to force all calls to `TpdaLiquidationPair.swapExactAmountOut()` to revert:
+
+- Assume a vault has the following state:
+  - The amount of `_availableYield` in the vault is `1000e18`.
+  - The amount of shares currently minted is `type(uint96).max - 2000e18`, so `_liquidYield` is not restricted by the mint limit.
+  - `yieldFeePercentage = 0` and `smoothingFactor = 0`.
+- A liquidation bot calls `swapExactAmountOut()` with `_amountOut = 1000e18`.
+- An attacker front-runs the liquidation bot's transaction and deposits `1000e18 + 1` tokens, which mints the same amount of shares:
+  - The amount of shares minted is now `type(uint96).max - 1000e18 + 1`, which means the mint limit is `1000e18 - 1`.
+  - As such, the available balance in the vault is reduced to `1000e18 - 1`.
+- The liquidation bot's transaction is now executed:
+  - In `swapExactAmountOut()`, `_amountOut > availableOut` so the call reverts.
+
+Note that the `type(uint96).max` mint limit is reachable for tokens with low value. For example, PEPE has 18 decimals and a current price of $0.00001468, so `type(uint96).max` is equal to $1,163,070 worth of PEPE. For tokens with a higher value, the attacker can borrow funds in the front-run transaction, and back-run the victim's transaction to return the funds.
+
+This is an issue as the price paid by liquidation bots for the liquidatable balance decreases linearly over time:
+
+[TpdaLiquidationPair.sol#L191-L195](https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-tpda-liquidator/src/TpdaLiquidationPair.sol#L191-L195)
+
+```solidity
+        uint256 elapsedTime = block.timestamp - lastAuctionAt;
+        if (elapsedTime == 0) {
+            return type(uint192).max;
+        }
+        uint192 price = uint192((targetAuctionPeriod * lastAuctionPrice) / elapsedTime);
+```
+
+As such, an attacker can repeatedly perform this attack (or deposit sufficient funds until the mint limit is 0) to prevent any liquidation bot from swapping the liquidatable balance. After the price has decreased sufficiently, the attacker can then swap the liquidatable balance for himself at a profit.
+
+## Impact
+
+By depositing funds into a vault to reach the mint limit, an attacker can DOS all calls to `TpdaLiquidationPair.swapExactAmountOut()` and prevent liquidation bots from swapping the vault's liquidatable balance. This allows the attacker to purchase the liquidatable balance at a discount, which causes a loss of funds for users in the vault.
+
+## Code Snippet
+
+https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-tpda-liquidator/src/TpdaLiquidationPair.sol#L141-L144
+
+https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-tpda-liquidator/src/TpdaLiquidationPair.sol#L184-L186
+
+https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-vault/src/PrizeVault.sol#L687-L709
+
+https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-tpda-liquidator/src/TpdaLiquidationPair.sol#L191-L195
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+Consider implementing `liquidatableBalanceOf()` and/or `_availableBalance()` such that it is not restricted by the vault's mint limit. 
+
+For example, consider adding a `_tokenOut` parameter to `TpdaLiquidationPair.swapExactAmountOut()` for callers to specify the output token. This would allow liquidation bots to swap for the vault's asset token, which is not restricted by the mint limit, when the mint limit is reached.
+
+
+
+## Discussion
+
+**trmid**
+
+If the prize vault owner is deploying with an asset that is expected to be close to the TWAB limit in deposits, they can set a liquidation pair that liquidates the yield as assets instead of shares to bypass this limit.
+
+However, it would not be advisable to deploy a prize vault with an asset that is expected to reach the clearly documented TWAB limits.
+
+**nevillehuang**
+
+@WangSecurity @trmid  I overlooked this issue. This should be a duplicate of #19, still considering validity and severity
+
+**Hash01011122**
+
+@nevillehuang This appears to be dup of #88 not #19 
+
+**MiloTruck**
+
+> This appears to be dup of #88 not #19
+
+It's not a dupe of #88, #88 is describing how the calculation in `liquidatableBalanceOf()` doesn't take into account the mint limit when `_tokenOut == address(_asset)`. I intentionally didn't submit it since I believe it's low severity.
+
+This issue describes how you can intentionally hit the mint limit to prevent liquidations from occurring. 
+
+**MiloTruck**
+
+> I overlooked this issue. This should be a duplicate of #19, still considering validity and severity
+
+@nevillehuang Would just like to highlight that the main bug here is being able to DOS liquidations due to the mint limit, being able to reduce the auction price is just one of the impacts this could have. This is not to be confused with #38, which doesn't need liquidations to be DOSed to occur.
+
+Perhaps this issue is more similar to #22 than #19. 
+
+**0x73696d616f**
+
+This is not a duplicate of #88, it's a duplicate of #19. I also did not intentionally submit this issue because it is a design choice.
+
+This one, #19 and all the dupes that depend on reaching the mint limit and bots not being able to liquidate because an attacker is DoSing them or similar are at most medium because:
+1. The owner can set liquidations to be based on the asset out.
+2. If any user withdraws, bots can liquidate anyway.
+3. Bots can use flashbots.
+4. For these issues to be considered, a large % of the pool is required by the attacker.
+5. DoS requiring the attacker to keep DoSing are considered 1 block DoSes.
+
+From these points, we can see that it is impossible to keep the DoS for a long period, so it is either considered a design choice or medium.
+
+**0xspearmint1**
+
+1. Even if the owner sets liquidations to be based on asset out the `_enforceMintLimit` function is still called and will revert the liquidation, as long as yieldFee is > 0 which it will be.
+
+```solidity
+if (_tokenOut == address(_asset)) {
+            _enforceMintLimit(_totalDebtBefore, _yieldFee); 
+```
+
+
+
+
+
+**WangSecurity**
+
+I agree this should be a duplicate of #19 (even though it may be more similar to #22, #22 is a duplicate of #19 itself). Since there is no escalation, planning to just duplicate it.
+
+**WangSecurity**
+
+Based on the discussion under #19, this report will be the main of the new family. Medium severity, because the attacker has to constantly keep the mint limit reached, which even with small tokens (SHIB or LADYS) needs large capital (flash loans cannot be used).
+
+# Issue M-5: The claimer's fee will be stolen by the winner 
+
+Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/73 
 
 ## Found by 
 0x73696d616f, cu5t0mPe0, jovi, ydlee
@@ -1578,7 +1006,96 @@ It is also worth noting that the prize hooks have a gas limit of 150k gas, which
 
 I believe medium severity is appropriate here, this issue wasn't highlighted as a known issue/risk, and watsons has highlighted another vector that allows stealing of claimer fees
 
-# Issue M-7: `PUSH0` opcode Is Not Supported on Linea yet 
+**InfectedIsm**
+
+Escalate
+
+
+The reason I think it shouldn't be valid is because its a front-run, and any profitable action can be front-run and nothing can be done against this.
+We can also show that a simple copy-paste front-run of the tx is always a better solution than that one.
+
+Here the attacker need (1) to detect the user A call (2) front-run it to update its hooks
+
+But if the user is able to do do this, then why wouldn't it simply copy-paste the whole user A call, and put his own claiming call before user A? He would get even more reward and more disturbance.
+ 
+Following the described attack path of this submission, the user will only be able to claim 2 prizes (before and after hooks), which will be less beneficial than front-running the whole claiming array with a standard claim call. 
+
+There is no way to defend against a front-run unless using the proposed remediation (using whitelist/blacklist), but this totally goes against the way the protocol is designed as a permissionnes protocol
+
+
+**sherlock-admin3**
+
+> Escalate
+> 
+> 
+> The reason I think it shouldn't be valid is because its a front-run, and any profitable action can be front-run and nothing can be done against this.
+> We can also show that a simple copy-paste front-run of the tx is always a better solution than that one.
+> 
+> Here the attacker need (1) to detect the user A call (2) front-run it to update its hooks
+> 
+> But if the user is able to do do this, then why wouldn't it simply copy-paste the whole user A call, and put his own claiming call before user A? He would get even more reward and more disturbance.
+>  
+> Following the described attack path of this submission, the user will only be able to claim 2 prizes (before and after hooks), which will be less beneficial than front-running the whole claiming array with a standard claim call. 
+> 
+> There is no way to defend against a front-run unless using the proposed remediation (using whitelist/blacklist), but this totally goes against the way the protocol is designed as a permissionnes protocol
+> 
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**0jovi0**
+
+> Escalate
+> 
+> The reason I think it shouldn't be valid is because its a front-run, and any profitable action can be front-run and nothing can be done against this. We can also show that a simple copy-paste front-run of the tx is always a better solution than that one.
+> 
+> Here the attacker need (1) to detect the user A call (2) front-run it to update its hooks
+> 
+> But if the user is able to do do this, then why wouldn't it simply copy-paste the whole user A call, and put his own claiming call before user A? He would get even more reward and more disturbance.
+> 
+> Following the described attack path of this submission, the user will only be able to claim 2 prizes (before and after hooks), which will be less beneficial than front-running the whole claiming array with a standard claim call.
+> 
+> There is no way to defend against a front-run unless using the proposed remediation (using whitelist/blacklist), but this totally goes against the way the protocol is designed as a permissionnes protocol
+
+The other dupes are not about the front-run but about the hooks allowing gas or prize fees to be stolen. Issue #82 and #161 describe a beforeClaimPrize hook that effectively steals prize fees without any mempool manipulation whatsoever.
+
+**0x73696d616f**
+
+It is not true that it would always be better to frontrun the tx and execute the same transaction because there is a bigger upfront cost and there is the risk that some claims have been made and a lot of gas is wasted. This allows gaming the claiming mechanism and could be fixed by simply adding a reentrancy lock. The bot would take a loss from this. The bot gives `300k` free gas to the user per prize claimed. As the bots will collect a lot of prizes for each user, the gas given to users is `300k*n`, where `n` is the number of prizes claimed. Thus, a simple frontrun to change the logic of a hook, will cost something like 30k gas, gives the user `300k * n` gas to claim prizes, at no risk, which is obviously problematic.
+
+**0x73696d616f**
+
+Also, is it possible to trick the simulation of the transaction so no frontrunning is needed? I am really curious about this. I was thinking about using `block.timestamp`, but there is a chance that the simulation fails. 
+
+**WangSecurity**
+
+I agree with the comments above, the fact that there may be a "better" attack path (which is explained not to be better in the comment above) doesn't mean this attack path won't be taken or it's negligible. Moreover, if the mitigation is not the best, it doesn't mean the issue is invalid.
+
+Planning to reject the escalation and leave the issue as it is.
+
+**WangSecurity**
+
+Result:
+Medium
+Has duplicates
+
+**sherlock-admin4**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [InfectedIsm](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/73/#issuecomment-2181056564): rejected
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/GenerationSoftware/pt-v5-claimer/pull/32
+
+
+# Issue M-6: `PUSH0` opcode Is Not Supported on Linea yet 
 
 Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/79 
 
@@ -1621,7 +1138,116 @@ Valid medium, since if current contract is deployed as is, it will have issues a
 
 > The protocol team can use the README (and only the README) to define language that indicates the codebase's restrictions and/or expected functionality. Issues that break these statements, irrespective of whether the impact is low/unknown, will be assigned Medium severity. High severity will be applied only if the issue falls into the High severity category in the judging guidelines.
 
-# Issue M-8: Potential ETH Loss Due to transfer Usage in Requestor Contract on `zkSync` 
+**10xhash**
+
+Escalate
+
+push0 is not present in the generated bytecode of any contract
+
+
+**sherlock-admin3**
+
+> Escalate
+> 
+> push0 is not present in the generated bytecode of any contract
+> 
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**elhajin**
+
+Foundry has a default **evm_version** set to **Paris**. If you compile directly with this default setting, you won't get the `PUSH0` opcode in the bytecode. However, by setting the environment variable **FOUNDRY_EVM_VERSION** to **Shanghai** or **Cancun**, or by compiling with the flag `--evm-version shanghai`, for example, the `PUSH0` opcode will be introduced.
+
+We don't know how devs will compile the codebase . Given this statement from the README:
+> We're interested to know if there will be any issues deploying the code as-is to any of these chains, and whether their opcodes fully support our application.
+
+I believe this is at least a medium severity issue according to Sherlock's rules.
+
+**InfectedIsm**
+
+Sherlock's rules :
+> V. How to identify a medium issue:
+>- Causes a loss of funds but requires certain external conditions or specific states, or a loss is highly constrained. The losses must exceed small, finite amount of funds, and any amount relevant based on the precision or significance of the loss.
+>-  Breaks core contract functionality, rendering the contract useless or leading to loss of funds.
+
+But here there are no loss of funds, neither core contract functionality broken/contract useless as the contract will simply not be deployable if I'm not mistaken
+
+But not only that, this is considered invalid by Sherlock's rules:
+> VII. List of Issue categories that are not considered valid:
+> ...
+> 24. Using Solidity versions that support EVM opcodes that don't work on networks on which the protocol is deployed is not a valid issue beacause one can manage compilation flags to compile for past EVM versions on newer Solidity versions.
+
+
+
+**elhajin**
+
+
+> The protocol team can use the README (and only the README) to define language that indicates the codebase's restrictions and/or expected functionality. **Issues that break these statements, irrespective of whether the impact is low/unknown, will be assigned Medium severity**. High severity will be applied only if the issue falls into the High severity category in the judging guidelines.
+
+**nevillehuang**
+
+Agree with comment [here](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/79#issuecomment-2181236835) and [here](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/79#issuecomment-2181500298), by sherlocks hierarchy of truth, escalations should be rejected:
+
+> If the protocol team provides specific information in the README or CODE COMMENTS, that information stands above all judging rules.
+
+**WangSecurity**
+
+Firstly, want to clarify that the hierarchy of truth quoted in the couple of messages above is the new one, while this contest uses an old version of rules. See [here](https://github.com/sherlock-protocol/sherlock-v2-docs/blob/4c718d402a5a6cdf1eb296c0e264a39a9a5aebc2/audits/judging/judging/README.md). Now, each contest has its rule version (the current rules at the contest start) and you can see the link on the contest's page (below the end date).
+
+Secondly, as I understand the current code can indeed be deployed on Linea, but using the older compiler version, correct? Taking the fact, that we don't know how the contracts will be compiled, into consideration, I believe the Rule 24 about EVM Opcodes still applies here and the issue is low severity. Unless this paragraph is not wrong, planning to accept the escalation and invalidate the issue.
+
+**nevillehuang**
+
+@WangSecurity 
+
+the old rules also point to read me overriding sherlock rules. Also when is the new rules introduced and from which contest is it applied (should make an announcement for important changes like this)
+
+> In case of conflict between information in the README vs Sherlock rules, the README overrides Sherlock rules
+
+the contracts will compile correctly because of the foundry configurations mentioned [here](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/79#issuecomment-2181236835). But with the given solidity version, push0 will cause deployment reverts given linea does not support this opcode.
+
+It is very likely there will be a zero constant somewhere within the codebase pushed onto the stack, but I agree watsons should verify this.
+
+**elhajin**
+
+Sorry didn't know about which rules are used.. but I think my point still hold 
+> SHERLOCK RULES (for this contest):  In case of conflict between information in the README vs Sherlock rules, the README overrides Sherlock rules
+
+> CONTEST README :  We're interested to know if there will be any issues deploying the code as-is to any of these chains, and whether their **opcodes fully support** our application
+
+- the compiling of the code depends on the command you run .. and how you set your environment variables and  **we don't know** how Devs will compile the code
+
+**amankakar**
+
+> CONTEST README : We're interested to know if there will be any issues deploying the code as-is to any of these chains, and whether their opcodes fully support our application
+
+The contest read me has a high priority over the Sherlock rules and the team is really interested to know if there is any opcode incompatibility,  This finding provides the clear explanation of issue which will result in DoS if deployed on Linea. 
+Hence the sponsor confirmed it which means they did not know about it.
+
+**WangSecurity**
+
+Excuse me for the confusion about the rules, I just meant to remind you about the commits each contest has and didn't mean to say that it somehow changes the situation.
+
+I believe this issue is indeed medium severity cause the protocol asked about issues with the contracts as-is and their opcodes. Planning to reject the escalation and leave the issue as it is.
+
+**WangSecurity**
+
+Result:
+Medium
+Has duplicates
+
+**sherlock-admin4**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [10xhash](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/79/#issuecomment-2180986847): rejected
+
+# Issue M-7: Potential ETH Loss Due to transfer Usage in Requestor Contract on `zkSync` 
 
 Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/80 
 
@@ -1698,51 +1324,627 @@ Requests remaining: **1**
 
 
 
-# Issue M-9: Withdrawals in the `PrizeVault` will not work for some vaults due to using `previewWithdraw()` and then `redeem()` 
+**InfectedIsm**
 
-Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/92 
+Escalate
 
-The protocol has acknowledged this issue.
+This submission make the assumption that the caller will set code in their callback to process received ETH.
+This pose the assumption that those callers will not be aware of the limitation of the transfer/send behavior on these chains.
+Setting code in the callback isn't required at all for the caller.
+By simply not setting code in their callback, the issue disappear, thus this is a user error and not a vulnerability of the codebase, but rather a proposition of improvement of the implemented mechanism.
+
+from the doc: https://docs.zksync.io/build/developer-reference/best-practices#use-call-over-send-or-transfer
+> Avoid using payable(addr).send(x)/payable(addr).transfer(x) because the 2300 gas stipend may not be enough for such calls, especially if it involves state changes that require a large amount of L2 gas for data. Instead, we recommend using call.
+
+
+**sherlock-admin3**
+
+> Escalate
+> 
+> This submission make the assumption that the caller will set code in their callback to process received ETH.
+> This pose the assumption that those callers will not be aware of the limitation of the transfer/send behavior on these chains.
+> Setting code in the callback isn't required at all for the caller.
+> By simply not setting code in their callback, the issue disappear, thus this is a user error and not a vulnerability of the codebase, but rather a proposition of improvement of the implemented mechanism.
+> 
+> from the doc: https://docs.zksync.io/build/developer-reference/best-practices#use-call-over-send-or-transfer
+> > Avoid using payable(addr).send(x)/payable(addr).transfer(x) because the 2300 gas stipend may not be enough for such calls, especially if it involves state changes that require a large amount of L2 gas for data. Instead, we recommend using call.
+> 
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**nevillehuang**
+
+I wouldn't call this user error because any address can be used to transfer funds to creator. Also it does not just affect caller with no code and there is clear evidence from the sponsor acknowledgement and lack of details in contest that the sponsor wasn't aware of this issue.
+
+**0xAadi**
+
+Disagreeing with the Escalation
+
+> By simply not setting code in their callback, the issue disappears.
+
+Removing the callbacks from the caller will not solve this issue.
+
+The core issue is not related to the use of code in the callback; rather, it is a limitation of the ZkSync chain. The core issue arises due to the dynamic gas measurement followed in ZkSync. 
+
+ZkSync usually requires more than 2300 gas to process `transfer()`/`send()` functions. Therefore, the `withdraw()` function will always revert due to the lack of enough gas to process `transfer()` on ZkSync.
+
+ZkSync explicitly mentions this in their security and best practice [documentation](https://docs.zksync.io/build/developer-reference/best-practices#use-call-over-send-or-transfer):
+
+> Avoid using payable(addr).send(x)/payable(addr).transfer(x) because the 2300 gas stipend may not be enough for such calls.
+
+The situation worsens if there are any callback functionalities in the caller.
+
+This is a known issue in ZkSync, as evidenced by previous occurrences in other protocols:
+
+* [921 ETH Stuck in zkSync Era](https://medium.com/coinmonks/gemstoneido-contract-stuck-with-921-eth-an-analysis-of-why-transfer-does-not-work-on-zksync-era-d5a01807227d)
+* [ZkSync Twitter Post](https://x.com/zksync/status/1644139364270878720)
+
+Note: Please see issues #24 and #139, which explain the issue in detail.
+
+
+**InfectedIsm**
+
+Fair enough, I wasn't able to find that even without callback execution it could spend more than 2300. 
+Sorry for the misunderstanding, and thanks for the detailed explanation!
+
+**0xAadi**
+
+In addition to my previous comment:
+
+This issue causes a loss of ETH in ZkSync.
+
+According to Sherlock's [docs](https://docs.sherlock.xyz/audits/judging/judging#iv.-how-to-identify-a-high-issue), this issue should be considered as valid HIGH:
+> IV. How to identify a high issue:
+>> 1. Definite loss of funds without (extensive) limitations of external conditions.
+
+Please consider upgrading the severity to HIGH.
+
+Please find my thoughts on the duplicates below:
+
+#24 and #139 both identify the same issue in ZkSync.
+#94 missed the aforementioned issue but did identify another medium-risk attack path.
+#119 missed both of the aforementioned attack paths but identified a more general issue.
+
+
+**WangSecurity**
+
+Since the escalator agrees with the other side (correct me if it's wrong) and based on the discussion above, I believe this issue should remain as it is. Planning to reject the escalation.
+
+**0xAadi**
+
+> the escalator agrees with the other side (correct me if it's wrong)
+
+true, [reference](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/80#issuecomment-2182191371)
+
+@WangSecurity, As I mentioned in this [duplicate](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/139) and [here](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/80#issuecomment-2182825792), This vulnerability can cause loss of ETH on the zkSync chain. 
+
+Therefore, please consider upgrading the severity of this issue from medium to high.
+
+**WangSecurity**
+
+Is there a specific number of ETH that has to be transferred in that case, or it can be as small as 1 wei? And as I understand there's still a possibility the `transfer` would work correctly? 
+
+**InfectedIsm**
+
+Rng draw rewards are very low ( <0.0001 WETH), as it can be seen on the Pool Together dashboard: https://analytics.cabana.fi/optimism
+The loss that will be experienced by rng drawer isn't large enough to be an argument for a high severity imo
+
+**WangSecurity**
+
+I agree with the comment above, I believe it's a small value and only caused on one chain, hence, I believe medium is more appropriate.
+
+The decision remains the same, planning to reject the escalation and leave the issue as it is.
+
+**WangSecurity**
+
+Result:
+Medium
+Has duplicates
+
+**sherlock-admin4**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [InfectedIsm](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/80/#issuecomment-2177993820): rejected
+
+# Issue M-8: Claimers Cannot Claim Prizes When Last Tier Liquidity is 0, Preventing Winners from Receiving Their Prizes 
+
+Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/84 
 
 ## Found by 
-0x73696d616f, 0xmystery, AuditorPraise
+elhaj
+## Summary
+ - The `Claimer` contract's `claimPrizes` function can revert when the prize for the tier `(numberOfTiers - 3)` is 0. This prevents all winners in this draw  from receiving their prizes (through claimer) and stops honest claimers from claiming rewards due to the transaction reverting.
+## Vulnerability Detail
+  - The [PrizePool](https://github.com/sherlock-audit/2024-05-pooltogether/blob/main/pt-v5-prize-pool/src/PrizePool.sol) contract holds the prizes and ensures that vault users who contributed to the `PrizePool` have the chance to win prizes proportional to their contribution and twab balance in every draw. On the other hand, the [Claimer](https://github.com/sherlock-audit/2024-05-pooltogether/blob/main/pt-v5-claimer/src/Claimer.sol) contract facilitates the claiming of prizes on behalf of winners so that winners automatically receive their prizes. **An honest claimer should always have the ability to claim prizes for correct winners in every draw.**
+- The [ClaimPrizes](https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-claimer/src/Claimer.sol#L90) function in the [Claimer](https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-claimer/src/Claimer.sol#L90) contract allows anyone to call it to claim prizes for winners. The caller (bots) computes the winners off-chain and they are incentivized through an auction mechanism where the reward increases over time if prizes are not claimed promptly.
+    ```js
+        function claimPrizes(IClaimable _vault, uint8 _tier, address[] calldata _winners, uint32[][] calldata _prizeIndices, address _feeRecipient, uint256 _minFeePerClaim)
+            external
+            returns (uint256 totalFees)
+        {
+        //some code ...
+
+            /**
+             * If the claimer hasn't specified both a min fee and a fee recipient, we assume that they don't
+             * expect a fee and save them some gas on the calculation.
+             */
+            if (!feeRecipientZeroAddress) {
+    >>        feePerClaim = SafeCast.toUint96(_computeFeePerClaim(_tier, _countClaims(_winners, _prizeIndices), prizePool.claimCount()));
+                if (feePerClaim < _minFeePerClaim) {
+                    revert VrgdaClaimFeeBelowMin(_minFeePerClaim, feePerClaim);
+                }
+            }
+
+            return feePerClaim * _claim(_vault, _tier, _winners, _prizeIndices, _feeRecipient, feePerClaim);
+        }
+    ```
+- Notice that the function calls the internal function `_computeFeePerClaim()` to compute the fee the claimer bot will receive based on the auction condition at this time. In `_computeFeePerClaim()`, another internal function `_computeDecayConstant` is called to compute the decay constant for the `Variable Rate Gradual Dutch Auction`:
+```js
+        function _computeFeePerClaim(uint8 _tier, uint256 _claimCount, uint256 _claimedCount) internal view returns (uint256) {
+        //some code .. 
+    >>    SD59x18 decayConstant = _computeDecayConstant(targetFee, numberOfTiers);
+        // more code ...
+        }
+        function _computeDecayConstant(uint256 _targetFee, uint8 _numberOfTiers) internal view returns (SD59x18) {
+    >>    uint256 maximumFee = prizePool.getTierPrizeSize(_numberOfTiers - 3); 
+    >>    return LinearVRGDALib.getDecayConstant(LinearVRGDALib.getMaximumPriceDeltaScale(_targetFee, maximumFee, timeToReachMaxFee));
+        }
+``` 
+- In `_computeDecayConstant`, the `maximumFee` is obtained as the prize of the `tier(_numberOfTiers - 3)`, which is the last tier before canary tiers. This value is then fed into the `LinearVRGDALib.getMaximumPriceDeltaScale()` function.
+- The issue arises when the `maximumFee` is zero, which can happen if there is no liquidity in this tier. With `maximumFee = 0`, the internal call to `LinearVRGDALib.getMaximumPriceDeltaScale()` will revert specifically in `wadLn` function when input is `0`, causing the transaction to revert:
+```js
+        function getMaximumPriceDeltaScale(uint256 _minFee, uint256 _maxFee, uint256 _time) internal pure returns (UD2x18) {
+            return ud2x18(SafeCast.toUint64(uint256(wadExp(wadDiv(
+                wadLn(wadDiv(SafeCast.toInt256(_maxFee), SafeCast.toInt256(_minFee))),//@audit : this will be zero 
+                SafeCast.toInt256(_time)) / 1e18))));
+        }
+
+        function wadLn(int256 x) pure returns (int256 r) {
+        unchecked {
+    >>    require(x > 0, "UNDEFINED");
+            // ... more code ..
+        }
+        }
+```
+- This means that even if a winner wins, the claimer won't be able to claim the prize for them if `tier(_numberOfTiers - 3).prize = 0`, unless they set fees to 0. However, no claimer will do this since they would be paying gas for another user's prize. This will lead to winners not receiving their prizes even when they have won, and it prevents the honest claimer from performing its expected job due to external conditions.
+- The winner in this case may win prizes from tiers less than `_numberOfTiers - 3`, which are rarer and higher prizes (they can't win prizes from tier `(_numberOfTiers - 3)` since it has 0 liquidity).
+- The `tier(_numberOfTiers - 3).prize` can be 0 in different scenarios (less liquidity that round to zero when devid by prize count,high `tierLiquidityUtilizationRate` ..ect). Here is a detailed example explain one of the scenarios that can lead to `tier(_numberOfTiers - 3).prize= 0` :
+
+- ***Example Scenario***
+1. **Initial Setup**:
+    - Assume we have 4 tiers `[0, 1, 2, 3]`.
+    - Current draw is 5.
+    - `rewardPerToken = 2`.
+
+    2. **Awarding Draw 5**:
+    - `rewardPerToken` becomes 3.
+    - Prizes are claimed, and all canary prizes are claimed due to a lot of liquidity contribution in draw 5.
+    - Liquidity for each tier after draw 5:
+        | Tier | Reward Per Token (rpt) |
+        |------|------------------------|
+        | t0   | 0                      |
+        | t1   | 0                      |
+        | t2   | 3                      |
+        | t3   | 3                      |
+    - Notice that the remaining liquidity in tiers 2 and 3 (canary tiers) is 0 now.
+
+    3. **Awarding Draw 6**:
+    - Time passes, and the next draw is 6.
+    - Draw 6 is awarded, but there were no contributions.
+    - Since the claim count was high in the previous draw, the number of tiers is incremented to 5.
+    - Reclaim liquidity in both previous tiers 2 and 3, but there is no liquidity to reclaim.
+    - There is no new liquidity to distribute, so the `rewardPerToken` remains 3.
+    - Liquidity for each tier in draw 6:
+        | Tier | Reward Per Token (rpt) |
+        |------|------------------------|
+        | t0   | 0                      |
+        | t1   | 0                      |
+        | t2   | 3                      |
+        | t3   | 3                      |
+        | t4   | 3                      |
+
+    4. **Claiming Prizes**:
+    - A claimer computes the winners (consuming some resources) and calls `claimPrizes` with the winners.
+    - The `uint256 maximumFee = prizePool.getTierPrizeSize(_numberOfTiers - 3);` (tier2) will be 0 since there was no liquidity .
+    - This causes `wadLn(0)` to revert when trying to compute the claimer fees thus tx revert and claimer can't claim any prize.
+## Impact
+  -  claimers cannot claim prizes for legitimate winners due to the transaction reverting.
+  -  all Users who won the prizes in this awarded draw won't receive their prizes (unless they claim for them selfs with 0 fees which unlikely).
+## Code Snippet
+  - https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-claimer/src/Claimer.sol#L221
+  - https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-claimer/src/Claimer.sol#L272-L279
+  - https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-claimer/src/libraries/LinearVRGDALib.sol#L114
+  - https://github.com/transmissions11/solmate/blob/c892309933b25c03d32b1b0d674df7ae292ba925/src/utils/SignedWadMath.sol#L165-L167
+## Tool used
+ Manual Review , Foundry Testing
+## Recommendation
+ - handle the situation where `getTierPrizeSize(numberOfTiers - 3)` prize is `0`, to make sure that the prize for winner still can be claimed by claimers. 
+
+
+
+
+
+
+## Discussion
+
+**elhajin**
+
+- This issue is distinct from 112 . In 112 , the issue is that having more winners in a specific tier than the prize count for that tier would lead to **insufficient liquidity** for the excess winners in case the reserve isn't enough to cover that . However, this is not true, as the protocol addresses this using the **`tierUtilizationRatio`** to manage such situations, indicating that this is a known limitation. Otherwise, there would be no point in having the **`tierUtilizationRatio`** variable .
+
+- This issue is completely different. It addresses the scenario where the **`lastTier`** before the canary tiers has **0 liquidity**. In this situation, the claimer won't be able to claim any prize for all winners in this draw. As a result, winners in this draw won't receive their prizes.
+- given the lost of prize for winners , and Dos of claiming process , this should be high severity 
+
+**sherlock-admin3**
+
+> Escalate
+> @nevillehuang  This issue is distinct from #112 . In #112 , the issue is that having more winners in a specific tier than the prize count for that tier would lead to **insufficient liquidity** for the excess winners in case the reserve isn't enough to cover that . However, this is not true, as the protocol addresses this using the **`tierUtilizationRatio`** to manage such situations, indicating that this is a known limitation. Otherwise, there would be no point in having the **`tierUtilizationRatio`** variable .
+> 
+> - This issue is completely different. It addresses the scenario where the **`lastTier`** before the canary tiers has **0 liquidity**. In this situation, the claimer won't be able to claim any prize for all winners in this draw. As a result, winners in this draw won't receive their prizes.
+
+The escalation could not be created because you are not exceeding the escalation threshold.
+
+You can view the required number of additional valid issues/judging contest payouts in your Profile page,
+in the [Sherlock webapp](https://app.sherlock.xyz/audits/).
+
+
+**0xjuaan**
+
+Escalate
+
+On behalf of @elhajin 
+
+**sherlock-admin3**
+
+> Escalate
+> 
+> On behalf of @elhajin 
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**WangSecurity**
+
+To clarify, the users indeed can receive rewards, the problem is that they have to do that by themselves and without claimers? But claimers are DOSed?
+
+**elhajin**
+
+Yes .. and the argument here is **this is not the expected behaviour**
+- one of the main features of pooltogather is winners will receive prizes automatically through incentivized claimers and average users are not expected to check each draw if they win or not and claim their prizes .. 
+- so Dos on claiming will lead to winners not receiving their prizes except for those who claim for themselves which is not the protocol intent 
+
+**0x73696d616f**
+
+This is a design choice. They cap the fee to the the prize pool of the last non canary tier. If this is 0, then fine, new draws have to be awarded so there is enough fee (if users still want to claim, they can call it). If prizes are not claimed, the number of tiers will decrease, which will increase the fee for the next draw, as the number of tiers will be less, so each tier has more liquidity and the number of prizes for the fee tier (number - 3) decreases, so the fee [increases](https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-prize-pool/src/abstract/TieredLiquidityDistributor.sol#L425). So basically the transaction reverting or not does not matter because the max fee is 0, so if they want it to go through, they need to set the fee to 0.
+
+Think about it this way, if there are no contributions, or small contributions in the last draw (which is the requirement for this), the fee should also be 0 or small.
+
+**elhajin**
+
+Good point .. but i disagree that this is a designe choice
+- so in this case winners of tiers that are less then (numberOfTiers - 3) in this draw will lose their prizes due to **lack of incentive for claimers**.
+
+- this is still an issue. *Claimers should  always be incentivized to claim prizes for winners in each draw regardless of last tier liquidity* Since the protocol intent is winners get their prizes automatically. 
+
+Here a quote from the docs : 
+
+> Prizes expire every Draw. For daily prizes, that means they expire every 24 hours. **Incentivizing claimers is critical to ensure that users get their prizes**
+
+- the decrease of tiers in the next draw is irrelevant to this issue.. cause winners of previous draw already lost their prizes 
+
+> If this is 0, then fine, new draws have to be awarded so there is enough fee
+
+- this is not fine winning a prize for a user is the main idea of the protocol .. and if he lost his prize it's high likely he won't win it again in the new awarded draws
+
+**0x73696d616f**
+
+Claimers can not be incentivized if there was no liquidity provided, which was the design choice made by picking the last non canary tier prize size. The docs still match the code because the incentive is a % of something, if that something is 0, than the incentive is also 0.
+
+What I meant by it's fine, is that users can claim prizes themselves, sure the protocol prefers that bots claim it, but this does not mean users can not claim them, even more so when there was no liquidity contributed. Bots will have incentives in the next draw.
+
+Also, the fact that the transaction reverts when the prize is 0 has nothing to do with this, the issue itself is in how the protocol 
+calculates the max fee, which is based on the liquidity contributed in the previous draws. When the max fee is 0, bots should claim with `feeRecipientZeroAddress` set to `0` to save gas, if they wish to do.
+
+We can see that it is a design choice because the fix would be a different design of the fee, such as adding a fixed component, which is not a valid issue.
+
+**elhajin**
+
+I understand your POV.
+- just to add to my previous comments other tiers (less then numberOfTiers -3) rely on contribution from several draws (up to contribution of a user in last 365 draw for grand prize) to determine the prize size and winner .and my POV is Not incentive claimer to claim those prizes because one of those draws has small contribution is an issue.
+
+To summarize that for the judge: 
+- there is no incentives for claimers to claim prizes for winners when last tier liquidity equals 0 
+- this will lead to users who rely on the fact that prizes are distributed automatically lose their prizes 
+
+
+**0x73696d616f**
+
+It is a design choice and another proof is that the issue will never happen due to 
+1) utilization ratio, 
+2) requirement of claiming all prizes in the past draw in the canary tiers (and in some cases the last non canary tier, tier 4 to tier 4 and tier 5 to tier 4), 
+3) not having contributions for a whole draw 
+4) the shares of the last non canary tier are much bigger than the canary ties, so whatever liquidity is left is mostly sent to it.
+
+**Starting state, draw 5**
+4 tiers,
+canary tiers 1 and 2 are claimed 50% due to utilization ratio
+
+**Final state, draw 6**
+_Example1_, tiers move from 4 to 5
+even if 0 contributions in this draw, the previous canary tiers were only claimed 50%, so there is liquidity to distribute to tier 2 (the one that leads to the max fee), and most of it is sent there.
+
+_Example2_, tiers stay at 4
+even if 0 contributions, the last canary tiers will be distributed, and tier 1 (the max fee), even if the expected prizes were claimed for tier 1, still remains 50% liquidity + most of the amount from the canaries due to having more shares.
+
+**Starting state, draw 5**
+5 tiers,
+tier2, canary tiers 1 and 2 are claimed 50% due to utilization ratio
+
+**Final state, draw 6**
+tiers move down to 4
+tier2 and the canaries get redistributed, they were only claimed 50% due to the utilization ratio, so tier 1 (the max fee) will always have liquidity, even if no contributions occur and it receives most of the liquidity.
+
+So utilization ratio + requirement to claim all prizes + not having contributions in the whole draw + last non canary tier having much more shares than canary tiers make this issue impossible to happen 
+
+**elhajin**
+
+Will never happen???
+- I think you mixed things up; utilization ratio doesn't prevent the claiming of all the liquidity of a tier since we can have more winners than the prize count of a tier 
+-  utilization ratio and last tiers before canary have more prizes can also be a  helping factors to this issue to be presented  due to high liquidity fragmentation over all prizes then scaling down by utilisation ratio that rounds the prize  to zero
+- not having contribution in a draw is high likely as vaults doesn't accumulate yeild daily to contribute it 
+
+- I'd love the sponsor to leave his comment here
+
+**0x73696d616f**
+
+> I think you mixed things up; utilization ratio doesn't prevent the claiming of all the liquidity of a tier since we can have more winners than the prize count of a tier
+
+It decreases the likelihood a lot as it needs to outperform the expected claim counts by a big margin (double) on both canary tiers and the last non canary tier in some cases (tier 4 to tier 4 and tier 5 to tier 4). Assume 2 users, each 0.5 contribution to prize, probably of claiming both canaries twice is `0.5*0.5*0.5*0.5` = 0.0625 (simplifying 1 prize count per canary tier, doesnt matter having more in terms of expected probabilities, they always have to overperform by twice the amount).
+
+> utilization ratio and last tiers before canary have more prizes can also be a helping factors to this issue to be presented due to high liquidity fragmentation over all prizes then scaling down by utilisation ratio that rounds the prize to zero
+
+This doesnt matter, liquidity ratio just decreases 50% here, and the prize count does not get big enough to send to 0, even if we are in tier 11 (highly unlikely), 4^8 == 65536. The prize token is WETH, which has 18 decimals, 65536 / 1e18 / 0.5 == 1.31072e-13 WETH, which is a dust contribution, enough for this to not happen.
+
+> not having contribution in a draw is high likely as vaults doesn't accumulate yeild daily to contribute it
+
+It would require **all** vaults to not contribute in a day, which is highly unlikely.
+
+So if we multiply all these chances, as they all need to happen simultaneously (and the fact that the last non canary tier has more shares, so it will absorve most liquidity), this will never happen. And it is a design choice regardless, but wanted to get this straight.
+
+**WangSecurity**
+
+Firstly, I can confirm that it's not a design decision.
+
+Secondly, I agree that it's not a duplicate of #112. 
+
+Thirdly, based on the discussion above, this scenario indeed has significant requirements and constraints (based on [this](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/84#issuecomment-2187671302) and [this](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/84#issuecomment-2187580364) comments), moreover, it only DOSes the claimers, but the prizes can still be received. I understand that the goal is to claimers to claim prizes, still the prizes are not locked completely and can be claimed.
+
+Planning to accept the escalation and de-dup the report.
+
+**elhajin**
+
+- Odds for canary tiers are 100%, and the claimer is getting the whole prize of those tiers. This means it matters if the prize for canary tiers is more than the gas the claimer will spend to claim it. If so, the claimer will claim canary tiers, and it's highly likely that they will find a **lot** of winners for these tiers (even exceeding the liquidity those canary tiers have when claiming for them all) given the high odds.
+- When can this happen?
+  - This can happen when we have a large enough contribution in the previous draw since liquidity for canary tiers is redistributed each draw.
+- What happens when claimers claim all liquidity in canary tiers?
+  - The next draw will increase the number of tiers, and the new tier (newNumberOfTiers - 3) will get its liquidity from the contribution of this draw. So if there were no or small contributions in this draw, this tier will get 0 liquidity.
+- Why is it likely to get no contribution in the next draw while we got large enough liquidity in the previous draw?
+  - As mentioned in my comment above, vaults don't accumulate yield daily, and it's highly likely if they contributed yesterday, they will have no yield to contribute today.
+
+> It would require all vaults to not contribute in a day, which is highly unlikely.
+
+It's highly likely. We're talking about two vaults in production at the current time (even with 10 vaults, it's highly likely this will happen). Whether a design choice or not, let's let the judge decide.
+
+**0x73696d616f**
+
+@elhajin as the utilization ratio is 50%, the odds of claiming all canary tiers twice are close to `0.0625`.
+2 vaults is a really small number, it is expected to be more. Each vault has its own token, and more than 1 vault can exist for each token. So this number is likely to grow a lot.
+And keep in mind that these 2 events must happen at the same time, so the chance becomes really really small.
+
+If we think there is a 1% chance no contributions happen in a day (this number seems too big, I think the chance is even smaller, in normal operating conditions, as bots are incentivized to liquidate daily, if they don't, this is irregular), the chance would be `0.0625*0.01 = 0.0625%`, very small.
+
+And even if this happens (highly unlikely), users can still claim prizes for themselves, or even the protocol may choose to sponsor it.
+
+**elhajin**
+
+- Again, I still think it's highly likely to get no contribution in a day.
+- For example, if canary tiers are t2 and t3, each address (user) has chance to win up to : **4^2+ 4^3 = 80** prizes and we have **80*2(UR) = 160** prizes. I'm curious how you calculated the odds for claiming canary tiers given that we don't know how many users contributed to vaults and how many vaults contributed to the PrizePool in this draw?
+> As the utilization ratio is 50%, the odds of claiming all canary tiers twice are close to 0.0625.
+
+**0x73696d616f**
+
+> Again, I still think it's highly likely to get no contribution in a day.
+
+It's not the expected, regular behaviour. The protocol incentivizes liquidating daily, so anything other than this is unlikely. In this case, there are multiple vaults, even more unlikely. It would require having unexpected behaviour (not liquidating daily) for all vaults, which is very unlikely.
+
+About the odds, [here](https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-prize-pool/src/libraries/TierCalculationLib.sol#L106) is the calculation.
+Assuming 1 prize for the canary tiers, we need at least 2 users to get 4 prizes (if there are 2 users, they at most get 2 prizes, so this issue does not exist).
+If the users have each 50% of the vault contribution, than their chance to win is 50%, as canary tiers have 100% odds.
+So as each user has a 50% chance of winning, and we would need them to win both prizes each, which is `0.5*0.5*0.5*0.5`.
+The calculations just get more complicated math wise with more prizes, key is they have to overperform the system, which is very unlikely. Using a claim count of 1 gives a good idea of the likelihood.
+
+**elhajin**
+
+> It's not the expected, regular behaviour. The protocol incentivizes liquidating daily, so anything other than this is unlikely. In this case, there are multiple vaults, even more unlikely. It would require having unexpected behaviour (not liquidating daily) for all vaults, which is very unlikely
+
+- that's not true and you can check on-chain the deployed version of the protocol 
+
+- your calculation shows the probability of 6.25%(0.0625)  that all canary tiers will be claimed .. which is for me high enough
+
+- moreover I spoke about that with sponsor during the contest and he confirmed 
+![Screenshot_2024-06-26-13-11-14-00_572064f74bd5f9fa804b05334aa4f912.jpg](https://github.com/sherlock-audit/2024-05-pooltogether-judging/assets/124453227/a0602cb3-f798-4939-8604-9f009f341314)
+
+
+
+**0x73696d616f**
+
+@elhajin, the sponsor said it's possible to claim all prizes, which I agree with, but very unlikely, given the utilization ratio. But the fact that the vaults have to not contribute in the next day, further reduces the likelihood. The 2 chances multiplied are very low for this to be high, estimated at 0.0625% or less.
+
+**elhajin**
+
+ I think we made our points clear .. let's let the judge decide that ser🤝
+
+**0x73696d616f**
+
+And the expected behaviour part is true. Ok they only have 2 deployed vaults right now. But still the expected behaviour is them contributing daily. So the chances go from very low to non existent, considering winning all prizes by double the amount (0.0625) and not contributing in a single day. The actual chance is closer to 0.0625% or lower due to the 2 conditions, not just 6.25% as you mentioned.
+
+**0x73696d616f**
+
+Also, they have a lot of vaults deployed, 19, 12 and 11, respectively.
+https://optimistic.etherscan.io/address/0x0C379e9b71ba7079084aDa0D1c1Aeb85d24dFD39
+https://arbiscan.io/address/0x44be003e55e7ce8a2e0ecc3266f8a9a9de2c07bc
+https://basescan.org/address/0xe32f6344875494ca3643198d87524519dc396ddf
+
+**WangSecurity**
+
+To clarify, the chances of this happening is ~0.0625% and not 6.25%, so when @0x73696d616f wrote just 0.0625 it meant 0.0625%, correct?
+
+**0x73696d616f**
+
+Yes 0.0625%, after seeing that there are so many deployed vaults, it's even lower than this.
+
+**elhajin**
+
+@WangSecurity  how so 😐? it's 6%.. 
+`50*50*50*50/(100*100*100*100) = 625/100` which is 6.25% !! 
+It's basic math
+
+**0x73696d616f**
+
+@elhajin you are not multiplying by the chance of not liquidating in a whole day, which is very low as explained before. There are at least 12 vaults, so all vaults would have to behave unexpectedly and not liquidate in a day for this to happen. I attributed a chance of 1% to this scenario, which is very reasonable, in reality it will be lower.
+
+
+@WangSecurity to be clear, for this issue to happen all the canary prizes have to be claimed, which is a `6.25%` chance **AND** no contributions from **all** vaults can happen in a whole day, so we need to multiply both probabilities. The protocol expects vaults to liquidate daily and has a tpda mechanism in place to ensure this, it would be extremely unlikely for all vaults to not liquidate in a single day. Thus, we can use an upper bound chance of `1%` for this event, but we can see how it is extremely unlikely.
+So 0.0625*0.01 = 0.000625 = 0.0625%
+
+**elhajin**
+
+- First, we are not talking about that; we are talking about the probability that Canary tiers will be claimed, which is indeed 6.25%.
+
+- Second, you're stating some of your thoughts as facts (at least 12 vaults, contributing daily is the expected behavior , 1% no contribution), which I believe are not true.
+
+- Third, we don't know which vaults will be active (depending on users adopting them) and which will not. So, even with 100 vaults deployed, it's irrelevant if they are not active(anyone can deploy a vault).
+
+- When I was talking about on-chain activity, I meant how many vaults are contributing, not how many are deployed. And as you can see [here](https://optimistic.etherscan.io/address/0xF35fE10ffd0a9672d0095c435fd8767A7fe29B55), **we have only 1 contribution in 69 days** (I understand that the  V5 is still new).
+
+
+**0x73696d616f**
+
+> First, we are not talking about that; we are talking about the probability that Canary tiers will be claimed, which is indeed 6.25%.
+
+This is false, we need to multiply by the chance of all vaults not contributing in a day, @WangSecurity if u need any further explanation let me know but this is factual.
+
+> Second, you're stating some of your thoughts as facts (at least 12 vaults, contributing daily is the expected behavior , 1% no contribution), which I believe are not true.
+
+The chance of all vaults behaving in a way they are not incentivized to is extremely unlikely. We can use 1%, but it is likely lower than this. If we say each vault has 10% chance of not contributing in a day, the chance would be 0.1^12=1e-12, with 12 vaults. With 2 vaults, it's 0.1^2 = 0.01 = 1%. So the chance goes from very low to impossible. Also, if we have less vaults, the likelihood of not contributing in a day will decrease for each because there is way more liquidity to liquidate, so the incentive is huge.
+
+> Third, we don't know which vaults will be active (depending on users adopting them) and which will not. So, even with 100 vaults deployed, it's irrelevant if they are not active.
+
+With regular user operation it can be expected a decent number of vaults will be active, anything other than this is extremely unlikely and it's not what the protocol expects.
+
+> When I was talking about on-chain activity, I meant how many vaults are contributing, not how many are deployed. And as you can see here, we have only 1 contribution in 69 days (I understand that the protocol is still new).
+
+We need to talk about regular conditions, not some bootstrap phase. If you want to consider weird activity, than we need to consider the prize may be very small, this phase has a low likelihood of happening, bots may choose not claim all prizes due to low liquidity, so on and so forth. In phases like this bots may not even be setup so this issue will not happen anyway.
+
+This issue is an extremely edge case which will never happen, even medium is questionable. The stars would have to align for this to happen under normal operations.
+
+**Hash01011122**
+
+>The chance of all vaults behaving in a way they are not incentivized to is extremely unlikely. We can use 1%, but it is likely lower than this. If we say each vault has 10% chance of not contributing in a day, the chance would be 0.1^12=1e-12, with 12 vaults. With 2 vaults, it's 0.1^2 = 0.01 = 1%. So the chance goes from very low to impossible. Also, if we have less vaults, the likelihood of not contributing in a day will decrease for each because there is way more liquidity to liquidate, so the incentive is huge.
+
+H/M severity don't take likelihood, only impact and constraints.
+[REFERENCE](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/88#issuecomment-2195759609)
+If invalidation reason for this is likelihood then issue #88 should be invalid too
+
+**WangSecurity**
+
+Firstly, I believe the constraints for this scenario to happen are extremely high (all the canary prizes have to be claimed, which is a 6.25% chance AND no contributions from all vaults can happen in a whole day). Secondly, the prizes are not lost per se, it's just the claimers who are DOSed. I understand that's an important part of the protocol, but still the funds are not locked, and winners can claim the prizes themselves. 
+
+I believe based on these two points together, low severity is indeed more appropriate. The decision remains the same, planning to accept the escalation and de-dup this issue as invalid.
+
+**Hash01011122**
+
+Wrapping around my head on how this is not breakage of core functionality.
+>the prizes are not lost per se, it's just the claimers who are DOSed. I understand that's an important part of the protocol, but still the funds are not locked, and winners can claim the prizes themselves.
+
+**WangSecurity**
+
+I agree this breaks the core contract functionality, but it has to have impact besides just breaking the core contract functionality:
+
+> Breaks core contract functionality, rendering the contract useless or leading to loss of funds
+
+As I've said there are no funds lost, since the users can still claim the prizes. But, on the other hand, the idea that just came to my mind is that, claimers have their own contract `Claimer` and in the case of this issue, the entire contract is useless, correct?
+
+**elhajin**
+
+@WangSecurity That's the idea  . And claimer contract also in scope.
+
+**WangSecurity**
+
+With that, I still believe there is no loss of funds per se, because the prizes still can be claimed by the winners themselves. But, the core contract `Claimer` would useless in that case, since bots' attempts to claim prizes will revert. Hence, I believe it qualifies for the "Breaks core contract functionality, rendering the contract useless". If it's wrong then please correct me.
+
+Planning to accept the escalation and make a new family of medium severity. Are there any duplicates?
+
+**Hash01011122**
+
+There are no dupes of this issue its unique finding.
+
+**WangSecurity**
+
+Result:
+Medium
+Unique 
+
+**sherlock-admin2**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [0xjuaan](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/84/#issuecomment-2180798532): accepted
+
+# Issue M-9: DoSed liquidations as `PrizeVault::liquidatableBalanceOf()` does not take into account the `mintLimit` when the token out is the asset 
+
+Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/88 
+
+## Found by 
+0x73696d616f
 ## Summary
 
-`PrizeVault::_withdraw()` withdraws assets by calling `yieldVault.previewWithdraw(_assets - _latentAssets);` followed by `yieldVault.redeem(_yieldVaultShares, address(this), address(this));`, which may pull less assets than required, making the transaction revert.
+`PrizeVault::liquidatableBalanceOf()` is called in `TpdaLiquidationPair::_availableBalance()` to get the maximum amount to liquidate, which will be incorrect when `_tokenOut` is the `asset` of the `PrizeVault`, due to not taking the minted yield fee into account. Thus, it will overestimate the amount to liquidate and revert.
 
 ## Vulnerability Detail
 
-In EIP4626, it is stated that `previewWithdraw()` must return at least the amount of shares burned via `withdraw()`
-> MUST return as close to and no fewer than the exact amount of Vault shares that would be burned in a withdraw call in the same transaction. I.e. withdraw should return the same or fewer shares as previewWithdraw if called in the same transaction.
+`TpdaLiquidationPair::_availableBalance()` is called in `TpdaLiquidationPair::swapExactAmountOut()` to revert if the amount to liquidate exceeds the maximum and in `TpdaLiquidationPair::maxAmountOut()` to get the maximum liquidatable amount. Thus, users or smart contracts will [call](https://dev.pooltogether.com/protocol/guides/bots/liquidating-yield/#2-compute-the-available-liquidity) `TpdaLiquidationPair::maxAmountOut()` to get the maximum amount out and then `TpdaLiquidationPair::swapExactAmountOut()` with this amount to liquidate.
+> Compute how much yield is available using the [maxAmountOut](https://dev.pooltogether.com/protocol/reference/liquidator/TpdaLiquidationPair#maxamountout) function on the Liquidation Pair. This function returns the maximum number of tokens you can swap out.
 
-`previewRedeem()` must return at most the assets pulled when calling `redeem()`
-> MUST return as close to and no more than the exact amount of assets that would be withdrawn in a redeem call in the same transaction. I.e. redeem should return the same or more assets as previewRedeem if called in the same transaction.
-
-However, there is no strict dependency between the 2 and there may be some difference when mixing the 2 withdrawal flows as is done in `PrizeVault::_withdraw()`.
+However, this is going to revert whenever the minted yield fee exceeds the mint limit, as `PrizeVault::liquidatableBalanceOf()` does not consider it when the asset to liquidate is the asset of the `PrizeVault`. Consider `PrizeVault::liquidatableBalanceOf()`:
 ```solidity
-function _withdraw(address _receiver, uint256 _assets) internal {
+function liquidatableBalanceOf(address _tokenOut) external view returns (uint256) {
     ...
-    if (_assets > _latentAssets) {
-        // The latent balance is subtracted from the withdrawal so we don't withdraw more than we need.
-        uint256 _yieldVaultShares = yieldVault.previewWithdraw(_assets - _latentAssets);
-        // Assets are sent to this contract so any leftover dust can be redeposited later.
-        yieldVault.redeem(_yieldVaultShares, address(this), address(this));
+    } else if (_tokenOut == address(_asset)) { //@audit missing yield percentage for mintLimit
+        // Liquidation of yield assets is capped at the max yield vault withdraw plus any latent balance.
+        _maxAmountOut = _maxYieldVaultWithdraw() + _asset.balanceOf(address(this));
     }
     ...
 }
 ```
-`previewWithdraw()` is called to get the amount of shares and then `redeem()` is called with this amount, expecting to receive at least `_assets - _latentAssets` to transfer later to the receiver. However, there is no guarantee that at least the required assets will be pulled from the yield vault, which will make the transaction revert when it tries to transfer the assets to the receiver.
-
-Note1: the same issue is found in `PrizeVault::_depositAndMint()`, where the assets pulled in `mint()` may be more than the balance of the contract , which may be fixed with the same recommendation.
-Note2: the yield buffer does not help here as the buffer applies to already deposited assets accruing yield, not assets in the `PrizeVault`. As soon as the first deposit is made, all assets in the `PrizeVault` are deposited and a rounding error will make deposits or withdrawals fail.
+As can be seen from the code snipped above, the minted yield fee is not taken into account and the mint limit is not calculated. On `PrizeVault::transferTokensOut()`, a mint fee given by `_yieldFee = (_amountOut * FEE_PRECISION) / (FEE_PRECISION - _yieldFeePercentage) - _amountOut;` is always minted and the limit is enforced at the end of the function `_enforceMintLimit(_totalDebtBefore, _yieldFee);`. Thus, without limiting the liquidatable assets to the amount that would trigger a yield fee that reaches the mint limit, liquidations will be DoSed.
 
 ## Impact
 
-DoSed withdrawals due to `.safeTransfer()` reverting.
+DoSed liquidations when the asset out is the asset of the `PrizeVault`.
 
 ## Code Snippet
 
-https://github.com/sherlock-audit/2024-05-pooltogether/blob/main/pt-v5-vault/src/PrizeVault.sol#L1054
+https://github.com/sherlock-audit/2024-05-pooltogether/blob/main/pt-v5-vault/src/PrizeVault.sol#L693-L696
 
 ## Tool used
 
@@ -1752,7 +1954,20 @@ Vscode
 
 ## Recommendation
 
-Cap the transfer amount to the available balance.
+The correct formula can be obtained by inverting `_yieldFee = (_amountOut * FEE_PRECISION) / (FEE_PRECISION - _yieldFeePercentage) - _amountOut;`, leading to:
+```solidity
+function liquidatableBalanceOf(address _tokenOut) external view returns (uint256) {
+    ...
+    } else if (_tokenOut == address(_asset)) {
+        // Liquidation of yield assets is capped at the max yield vault withdraw plus any latent balance.
+        _maxAmountOut = _maxYieldVaultWithdraw() + _asset.balanceOf(address(this));
+        // Limit to the fee amount
+        uint256  mintLimitDueToFee = (FEE_PRECISION - yieldFeePercentage) * _mintLimit(_totalDebt) / yieldFeePercentage;
+       _maxAmountOut = _maxAmountOut >= mintLimitDueToFee ? mintLimitDueToFee : _maxAmountOut;
+    }
+    ...
+}
+```
 
 
 
@@ -1763,31 +1978,299 @@ Cap the transfer amount to the available balance.
 1 comment(s) were left on this issue during the judging contest.
 
 **infect3d** commented:
-> work as expected__ SR mixed previewRedeem values of prizeVault and yieldVault and recommandation break EIP4626 for prizeVault
+> the proposed remediation is in fact what is already done in the return statement
 
 
-
-**trmid**
-
-The 4626 spec is somewhat loose in the relationship between shares, assets, and the functions that convert them. Like the issue states, there is no *guaranteed* relationship between the withdrawal and redeem accounting. The spec even states that:
-
-> Details such as accounting and allocation of deposited tokens are intentionally not specified, as Vaults are expected to be treated as black boxes on-chain and inspected off-chain before use.
-
-The prize vault requires that these accounting functions are related and use the same accounting as part of the "Dust Collection Strategy" described: https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-vault/src/PrizeVault.sol#L38 
-
-Any discrepancy between the assets returned from `redeem` when passing in the shares computed from `previewWithdraw` would indicate that there exists either some fee or non-symmetrical accounting which would break the entire integration (not just the `_withdraw` function). As stated in the prize vault, yield sources with fees on deposit / withdraw flows are not supported: https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-vault/src/PrizeVault.sol#L66
-
-Given that the 4626 spec is so loosely defined that there could exist an implementation with no correlation at all between withdraw and redeem, it is not unreasonable to expect deployers of a prize vault to verify that the yield source they are integrating is indeed a "normal" integration that also contains no fees.
 
 **nevillehuang**
 
-Valid medium, since it was mentioned as the following
+If mint limit is reached then liquidations are capped per [comments](https://github.com/sherlock-audit/2024-05-pooltogether/blob/main/pt-v5-vault/src/PrizeVault.sol#L691)
 
-> PrizeVaults are expected to strictly comply with the ERC4626 standard.
+**0x73696d616f**
 
-Since the word "MUST" is used, based on the following sherlock guidelines:
+Escalate
 
-> The protocol team can use the README (and only the README) to define language that indicates the codebase's restrictions and/or expected functionality. Issues that break these statements, irrespective of whether the impact is low/unknown, will be assigned Medium severity. High severity will be applied only if the issue falls into the High severity category in the judging guidelines.
+This issue is valid because the docs state exactly how liquidations happen, and they will fail for some states, when they should go through.
+> Compute how much yield is available using the [maxAmountOut](https://dev.pooltogether.com/protocol/reference/liquidator/TpdaLiquidationPair#maxamountout) function on the Liquidation Pair. This function returns the maximum number of tokens you can swap out.
+
+So we can agree there is DoS, as it will revert when the number of shares is close to the mint limit.
+Liquidations use the tpda mechanism, so the price picked and the bot that gets awarded depend on being extremely timely in the liquidation. Thus, we conclude that liquidations are time sensitive.
+
+For these 2 reasons, this issue is valid.
+
+**sherlock-admin3**
+
+> Escalate
+> 
+> This issue is valid because the docs state exactly how liquidations happen, and they will fail for some states, when they should go through.
+> > Compute how much yield is available using the [maxAmountOut](https://dev.pooltogether.com/protocol/reference/liquidator/TpdaLiquidationPair#maxamountout) function on the Liquidation Pair. This function returns the maximum number of tokens you can swap out.
+> 
+> So we can agree there is DoS, as it will revert when the number of shares is close to the mint limit.
+> Liquidations use the tpda mechanism, so the price picked and the bot that gets awarded depend on being extremely timely in the liquidation. Thus, we conclude that liquidations are time sensitive.
+> 
+> For these 2 reasons, this issue is valid.
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**WangSecurity**
+
+> which will be incorrect when _tokenOut is the asset of the PrizeVault
+
+To clarify this line, you mean the asset of the underlying `yieldVault`, correct?
+
+As I see the yield fee is taken [here](https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-vault/src/PrizeVault.sol#L708) in the return statement of the function?
+
+**0x73696d616f**
+
+Yes `_tokenOut` is the asset of the underlying vault.
+The problem is that when this asset is picked, a fee is still minted and the mint limit is enforced, see [here](https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-vault/src/PrizeVault.sol#L746).
+But `liquidatableBalanceOf()` does not take into account that a fee is minted even if the asset picked is `_tokenOut`. You can see [here](https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-vault/src/PrizeVault.sol#L695) that the mint limit is not checked.
+So it overestimates the maximum liquidatable balance and makes liquidations fail.
+The maximum liquidatable balance should be capped to take into account the fee, with the exact recommendation given in the issue.
+
+**InfectedIsm**
+
+I may have missed something @0x73696d616f, but isn't it what is done in the final return statement?
+
+
+```solidity
+    function liquidatableBalanceOf(address _tokenOut) external view returns (uint256) {
+        uint256 _totalDebt = totalDebt();
+        uint256 _maxAmountOut;
+        if (_tokenOut == address(this)) {
+            // Liquidation of vault shares is capped to the mint limit.
+            _maxAmountOut = _mintLimit(_totalDebt); 
+        } else if (_tokenOut == address(_asset)) {
+            // Liquidation of yield assets is capped at the max yield vault withdraw plus any latent balance.
+            _maxAmountOut = _maxYieldVaultWithdraw() + _asset.balanceOf(address(this)); <----
+        } else {
+            return 0;
+        }
+
+        // The liquid yield is limited by the max that can be minted or withdrawn, depending on
+        // `_tokenOut`.
+        uint256 _availableYield = _availableYieldBalance(totalPreciseAssets(), _totalDebt);
+        uint256 _liquidYield = _availableYield >= _maxAmountOut ? _maxAmountOut : _availableYield; <----
+
+        // The final balance is computed by taking the liquid yield and multiplying it by
+        // (1 - yieldFeePercentage), rounding down, to ensure that enough yield is left for
+        // the yield fee.
+        return _liquidYield.mulDiv(FEE_PRECISION - yieldFeePercentage, FEE_PRECISION); <----
+    }
+
+```
+
+We see that the return value of `liquidatableBalanceOf` is: `_maxAmountOut * (FEE_PRECISION - yieldFeePercentage) / FEE_PRECISION` (1)
+
+So the amount that is returned by `liquidatableBalanceOf()` is reduced by the fee that will be taken.
+
+And in fact, if you plug (1) as `_amountOut` [into](https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-vault/src/PrizeVault.sol#L731) :
+(2) `_yieldFee = (_amountOut * FEE_PRECISION) / (FEE_PRECISION - _yieldFeePercentage) - _amountOut` 
+
+you get `_yieldFee = fee * _maxAmountOut` (3)
+
+If we rewrite (1) in a more readable way we have `liquidatableBalanceOf = _maxAmountOut * ( 1 - fee)` (4)
+
+And if you add (3) the fee amount + (4) _amountOut that will be sent to user, we get:
+`maxAmountOut * fee + maxAmountOut * (1 - fee)  ==  maxAmountOut * (fee + 1 - fee)  ==  maxAmountOut`
+
+So everything seems to fit correctly ?
+
+
+**0x73696d616f**
+
+Yes, that part is correct, but the limit is not actually enforced, if you notice regardless of the mint limit, it always returns a value bigger than 0.
+Example, maxAmountOut = 10000 (there is 10000 yield to be liquidated)
+there are 10 shares left to the mint limit
+yield fee is 1%
+so it would return `10000*99/100` = 9900
+then, the fee to mint is `9900*100/(100 - 1) - 9900` = 100
+and 100 > 10, so it reverts
+
+the correct max amount is, `(100 - 1)*10/1 = 990`, as mentioned in the issue
+if we do `990*100/(100 - 1) - 990` = 10, which is the max shares that can be minted
+
+**InfectedIsm**
+
+Got it thanks, so when the total prize vault shares is close to `TWAB_SUPPLY_LIMIT` , then it is possible that the fee to mint based on the maximum liquidatable underlying asset amount is greater than the `mintLimit = TWAB_SUPPLY_LIMIT - _existingShares`, thus causing a revert during the `_enforceMintLimit` call
+The liquidation pair `smoothingFactor` coupled with the relatively low value of the fee means that the vault must be really close the the `TWAB_SUPPLY_LIMIT` for this to happen, but when vault is near 100% of its capacity it can happen more frequently, or even make it impossible to liquidate when `TWAB_SUPPLY_LIMIT` is reached
+This could be addressed by manually setting the yield fees to 0 if it happens, though manual intervention would still be required.
+
+**WangSecurity**
+
+And last clarification, excuse me if a silly one, but want to confirm if it's correct:
+
+This issue doesn't require the mintLimit to be reached, but to be very close to it? I see that it can happen even if it's not close to the limit, but will be more often?
+
+**0x73696d616f**
+
+It gets more likely the closer we are to the limit, as the value required to trigger it decreases. In the example [here](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/88#issuecomment-2187267249), the 990 tokens would not be liquidated, as it tries to liquidate way more and reverts.
+
+**WangSecurity**
+
+Thank you for that clarification, with that I agree that it's valid issue. Planning to accept the escalation and validate with medium severity.
+
+**Hash01011122**
+
+@WangSecurity Shouldn't this be low severity, as the likelihood of this to occur is very low.
+
+Firstly, for this to occur is `_tokenOut` should be the asset `PrizeVault`,
+
+Secondly, fee to mint based on the maximum liquidatable underlying asset amount is greater than `_enforceMintLimit`, thus causing a revert during the `_enforceMintLimit` call
+
+Thirdly, Watson assumes that protocol wouldn't react if `maxAmountOut` and `_enforceMintLimit` happens to create this scenario 
+which can be ensured when protocol manually sets the yield fees to 0 as pointed out @InfectedIsm 
+
+Likelihood of this to occur is very low and with no impact.
+
+Also, check out @MiloTruck comment here: 
+https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/39#issuecomment-2182180107
+
+**0x73696d616f**
+
+@Hash01011122 
+> Firstly, for this to occur is _tokenOut should be the asset PrizeVault
+
+This does not decrease the likelihood, it's a perfectly valid choice.
+
+> Secondly, fee to mint based on the maximum liquidatable underlying asset amount is greater than _enforceMintLimit, thus causing a revert during the _enforceMintLimit call
+
+This is the only requirement, but still means a considerable amount of tokens could not be liquidated. Without this requirement, it would be a high.
+
+> Thirdly, Watson assumes that protocol wouldn't react if maxAmountOut and _enforceMintLimit happens to create this scenario
+which can be ensured when protocol manually sets the yield fees to 0 as pointed out @InfectedIsm
+
+This changes nothing because the function is time sensitive so it's crucial for bots to ensure this does not revert. If the bot reverts due to this, it would not get the price itself, taking a loss and the price will be different.
+
+> Likelihood of this to occur is very low and with no impact.
+
+It's not very low as the limit may be reached and it causes DoS and is time sensitive (and loss of funds for users of the vault, as they would get less tokens in return, as the price would keep going down), hence medium is appropriate.
+
+> Also, check out @MiloTruck comment here:
+https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/39#issuecomment-2182180107
+
+It has no relevance that another watson says very vaguely that the issue is low.
+
+**Hash01011122**
+
+>This changes nothing because the function is time sensitive
+
+Any idea how much time sensitive it really is @0x73696d616f @trmid @nevillehuang??
+
+**0x73696d616f**
+
+@Hash01011122 yes, look at the way the tpda liquidation works, there are 2 reasons:
+1. the price keeps decreasing, so if it is DoSed vault users will receive less prize tokens in return of the liquidation.
+2. the first bot that calls the function to liquidate should get the profit, but it doesn't and the profit goes to someone else.
+
+**Hash01011122**
+
+@0x73696d616f I didn't quite understand what you commented, would you mind elaborating this one please.
+
+**0x73696d616f**
+
+@Hash01011122 no problem, the liquidation is performed by the liquidation pair.
+This liquidation pair computes the price [here](https://github.com/sherlock-audit/2024-05-pooltogether/blob/main/pt-v5-tpda-liquidator/src/TpdaLiquidationPair.sol#L132), `uint192 price = uint192((targetAuctionPeriod * lastAuctionPrice) / elapsedTime);`. The longer `elapsedTime`, the smaller the price becomes. So DoSing liquidations will decrease the price.
+This price, is how many tokens are sent to the prize pool as a contribution from the respective vault that is being liquidated. So by decreasing the price, the vault that is liquidated will get a lower contribution to the prize pool, decreasing prizes for all users of that vault.
+
+For point 2, bots are racing in this game to try to liquidate in great conditions. Ideally, each bot wants a price as low as possible, but the catch is that if they wait too much, other bot may liquidate instead. Thus, as the first bot that tries to liquidate reverts, it will not get the prize, when it should.
+
+**MiloTruck**
+
+Going to add context as to why I think this is valid, but low severity.
+
+Liquidations occur through `swapExactAmountOut()`, which essentially does the following:
+- `swapAmountIn` is the amount of prize tokens that has to be transferred in. This is determined by `_computePrice()`, a linearly decreasing auction that decreases the price from infinity to near-zero over time.
+- The liquidator specifies `_amountOut`, which is the amount of yield tokens he wants to receive.
+- The liquidator pays `swapAmountIn` of prize tokens and receives `_amountOut` of yield tokens.
+
+It's important to realize that `liquidatableBalanceOf()` is only used as the upper limit for `_amountOut`:
+
+[TpdaLiquidationPair.sol#L141-L144](https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-tpda-liquidator/src/TpdaLiquidationPair.sol#L141-L144)
+
+```solidity
+uint256 availableOut = _availableBalance();
+if (_amountOut > availableOut) {
+    revert InsufficientBalance(_amountOut, availableOut);
+}
+```
+
+This means that when a liquidator calls `swapExactAmountOut()`, he can specify anything from `0` to the value returned by `liquidatableBalanceOf()` multiplied by the smoothing factor (ie. `TpdaLiquidationPair.maxAmountOut()`).
+
+The issue here describes how `liquidatableBalanceOf()` doesn't account for the mint limit, so it will return a liquidatable balance higher than the actual amount of yield tokens that can be transferred out. In this case, if `swapExactAmountOut()` is called with `_amountOut = maxAmountOut()`, it will revert as the issue has stated.
+
+However, just because `swapExactAmountOut()` can revert when you pass a certain `_amountOut` value doesn't mean it will DOS liquidations. `liquidatableBalanceOf()` only returns the **maximum** liquidatable balance, so `swapExactAmountOut()` can always be called with a smaller `_amountOut` value so that it doesn't revert.
+
+Assuming the vault is close to the mint limit, the scenario is:
+
+- `liquidatableBalanceOf()` returns an inflated liquidatable balance.
+- The "actual liquidatable balance" (ie. a value for `_amountOut` at which the mint limit won't be hit and `swapExactAmountOut()` passes) is smaller than `liquidatableBalanceOf()`. Note that this is the value `liquidatableBalanceOf()` would return if the recommendation was applied.
+
+So what would happen is liquidators would just call `swapExactAmountOut()` with the actual liquidatable balance, such that the liquidation process doesn't revert. And the linearly decreasing auction mechanism ensures that a price for this actual liquidatable balance will always be found.
+
+To lay it out simply, something like this would occur (assume the smoothing factor is 100% for simplicity):
+
+1. `_computePrice()` decreases from infinity to a fair price for the liquidatable balance returned by `maxAmountOut()`.
+2. Liquidator calls `swapExactAmountOut()` with `_amountOut = maxAmountOut()`, but realizes it reverts.
+3. Liquidators waits for `_computePrice()` to decrease further until a fair price is reached for the vault's actual liquidatable balance.
+4. Liquidator calls `swapExactAmountOut()` with `_amountOut` as the actual liquidatable balance, which doesn't revert.
+
+The only impact here is that `maxAmountOut()` returns an inflated value, so liquidation bots calling `swapExactAmountOut()` in (2) waste gas. However, nearly all bots simulate their transactions beforehand, so the bot would simply realize that the transaction reverts and not send it.
+
+You could argue that `maxAmountOut()` returns a wrong value and bots won't be able to figure out what `_amountOut` should be in (4), but this is equivalent to saying a view function not used anywhere else in the code returning the wrong value is medium severity.
+
+**0x73696d616f**
+
+> Liquidator calls swapExactAmountOut() with _amountOut = maxAmountOut(), but realizes it reverts.
+
+This is enough to cause problems, as it is an [extremely](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/88#issuecomment-2192246210) time sensitive function. The price keeps going down and liquidations remain DoSed as it is a key function and part of the liquidation flow, explicitly stated by the protocol (it makes sense because bots want as much amount as possible so they will always call it before liquidating), so this is the source of truth, regardless of workarounds (which will not work as bots don't have much time to fix this, auctions last [6](https://arbiscan.io/address/0xef9eef2506f10f00edb5b91d64c2ebc7557192b1#readContract) hours, so they will not fix in time and the price drops too much)
+> Compute how much yield is available using the [maxAmountOut](https://dev.pooltogether.com/protocol/reference/liquidator/TpdaLiquidationPair#maxamountout) function on the Liquidation Pair. This function returns the maximum number of tokens you can swap out.
+
+
+**WangSecurity**
+
+Firstly, I agree that liquidation is a time-sensitive function. Secondly, as said in the docs, `maxAmountOut` is function that has to be called to determine the max amount that can be liquidated. With these two factors together, I believe this issue is indeed medium.
+
+The decision remains the same, accept the escalation and upgrade severity to medium.
+
+Also, @Hash01011122, H/M severity don't take likelihood, only impact and constraints.
+
+**0x73696d616f**
+
+> The decision remains the same, accept the escalation and leave the issue as it is.
+
+Think you mean upgrade to medium 
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/GenerationSoftware/pt-v5-vault/pull/114
+
+
+**WangSecurity**
+
+@nevillehuang @0x73696d616f are there any duplicates?
+
+**WangSecurity**
+
+Result:
+Medium
+Unique 
+
+**sherlock-admin2**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [0x73696d616f](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/88/#issuecomment-2180617007): accepted
+
+**nevillehuang**
+
+@WangSecurity Not as far as I know.
 
 # Issue M-10: Estimated prize draws in TieredLiquidityDistributor are off due to rounding down when calculating the sum, leading to incorrect prizes 
 
@@ -1912,205 +2395,172 @@ canaryValue = 1000*5/310 = 16
 
 The existing algorithm returns the expected number of tiers based on claims. The calculation *informs* the rest of the system on the number of tiers. As long as the tiers can go up and down based on the network conditions, there is no unexpected consequence of the calculation rounding down.
 
-# Issue M-11: When `PrizePool` reserves are low and more than expected number of prizes are won, race conditions are created to claim prizes. Some users' prize funds will be locked due to `PrizePool::claimPrize()` call reverting. 
+**MiloTruck**
 
-Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/112 
+Escalate
 
-The protocol has acknowledged this issue.
+I believe this issue should be low severity as there is barely any impact.
 
-## Found by 
-Nihavent, elhaj, evmboi32
-### When `PrizePool` reserves are low and more than expected number of prizes are won, race conditions are created to claim prizes. Some users' prize funds will be locked due to `PrizePool::claimPrize()` call reverting
+> This mechanism works to offset luck in the draw. If a certain draw is claimed too many times compared to the expected value, it will likely increase the max tier in the next draw, and decrease the expected rewards of the next draw.
 
-## Summary
+This is only partially true. The primary purpose of increasing/decreasing the number of tiers based on the number of prizes claimed is to adapt to fluctuating gas prices due to network congestion. When gas prices are cheap, more prizes will be claimed than the expected amount. The pool adapts to this by moving up one tier, thereby decreasing the rewards per prize as it will still be profitable to claim prizes with low gas costs. The converse is also true for when gas prices are expensive.
 
-The determination of winners for a given draw and tier are statistically independant events. That is, if Alice winning a prize for a given draw and tier does not make it more or less likely that Bob will win a prize in the same draw and tier. Consequently, there may be more (or less) than expected winners in any given draw. 
-This can be an issue because the `tierLiquidity.prizeSize` for a given tier and draw is based on the expected number of winners, not the actual number of winners. In the case where there is more than the expected number of winners there may not be enough liquidity in the reserve to cover the extra prize(s). 
-Under these circumstances, there is a race for users' to call `PrizePool::claimPrize()` before the liqudiity in the tier runs out. Once tier liquidity runs out, there will be user(s) who are geneuine winners for a given draw and tier (`PrizePool::isWinner()` returns true), but calls to `PrizePool::claimPrize()` for their address will revert, resulting in their prize-funds being locked.
+`ESTIMATED_PRIZES_PER_DRAW_FOR_5_TIERS` and the other values are an approximation of the expected number of prizes claimed; they don't have to be the _exact_ values calculated. As long as they are roughly around their exact values, which they are in this case, the number of tiers will still increase/decrease to adapt to changing gas prices.
 
-As an analogy, the protocol is currently like a lottery where there can be more than 1 grand prize winner (tier 0). In the event there is 2 grand prize winners, it allows both users to make a claim on the full grand prize instead of allocating an equal portion to each winner. The issue is present in each tier level with varying frequencies and impacts.
+I believe this is what the sponsor means by "As long as the tiers can go up and down based on the network conditions, there is no unexpected consequence".
 
-## Vulnerability Detail
+> The estimated prize count will be off, which affects the calculation of the next number of tiers in `PrizePool::computeNextNumberOfTiers()`. This modifies the whole rewards distribution for the next draw.
 
-The expected number of prizes awarded for any given draw and tier is given by 4^t where t is the tier number. For example, in tier 1, there is 4 expected prizes. In reality, this means over a large number of draws the average number of tier 1 prizes awarded per draw will approach 4.
+This is an over-exaggeration of the impact. There is no "correct" rewards distribution for the next draw based on the number of prizes claimed - as long as the rewards distribution scales to accommodate fluctuating gas prices, the mechanism has fulfilled its purpose and there is no issue.
 
-https://github.com/sherlock-audit/2024-05-pooltogether/blob/main/pt-v5-prize-pool/src/libraries/TierCalculationLib.sol#L39-L41
+**sherlock-admin3**
 
-The way this is implemented, in tier t, is by allowing users to generate 4^t different `userSpecificRandomNumber` in the `PrizePool::isWinner()` function. This means, users get 4^t chances to generate a random number in the winning zone (ie. in tier t, users are 4^t more likely to be able to claim a prize than in tier 0).
+> Escalate
+> 
+> I believe this issue should be low severity as there is barely any impact.
+> 
+> > This mechanism works to offset luck in the draw. If a certain draw is claimed too many times compared to the expected value, it will likely increase the max tier in the next draw, and decrease the expected rewards of the next draw.
+> 
+> This is only partially true. The primary purpose of increasing/decreasing the number of tiers based on the number of prizes claimed is to adapt to fluctuating gas prices due to network congestion. When gas prices are cheap, more prizes will be claimed than the expected amount. The pool adapts to this by moving up one tier, thereby decreasing the rewards per prize as it will still be profitable to claim prizes with low gas costs. The converse is also true for when gas prices are expensive.
+> 
+> `ESTIMATED_PRIZES_PER_DRAW_FOR_5_TIERS` and the other values are an approximation of the expected number of prizes claimed; they don't have to be the _exact_ values calculated. As long as they are roughly around their exact values, which they are in this case, the number of tiers will still increase/decrease to adapt to changing gas prices.
+> 
+> I believe this is what the sponsor means by "As long as the tiers can go up and down based on the network conditions, there is no unexpected consequence".
+> 
+> > The estimated prize count will be off, which affects the calculation of the next number of tiers in `PrizePool::computeNextNumberOfTiers()`. This modifies the whole rewards distribution for the next draw.
+> 
+> This is an over-exaggeration of the impact. There is no "correct" rewards distribution for the next draw based on the number of prizes claimed - as long as the rewards distribution scales to accommodate fluctuating gas prices, the mechanism has fulfilled its purpose and there is no issue.
 
-https://github.com/sherlock-audit/2024-05-pooltogether/blob/main/pt-v5-prize-pool/src/PrizePool.sol#L1022-L1029
+You've created a valid escalation!
 
-```javascript
-    uint256 userSpecificRandomNumber = TierCalculationLib.calculatePseudoRandomNumber(
-      lastAwardedDrawId_,
-      _vault,
-      _user,
-      _tier,
-@>    _prizeIndex,
-      _winningRandomNumber
-    );
-```
+To remove the escalation from consideration: Delete your comment.
 
-The user wins a prize for a given vault, draw, tier, and prize index if their user-specific uniformly distributed psuedo-random number falls within the `winning zone`:
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
 
-https://github.com/sherlock-audit/2024-05-pooltogether/blob/main/pt-v5-prize-pool/src/libraries/TierCalculationLib.sol#L68-L70 
+**0x73696d616f**
 
-Due to the statistical independence of each user's random numbers generated, there is theoretically no limit to the number of prizes that can be won in a given draw and tier. This results in the possibility of the required liquidity in a tier exceeding the available liquidity in that tier. 
+@MiloTruck there is a correct expected number of prizes, based on the odds and prize count for each tier, and this issue proves it will be off due to rounding down, when it could be fixed (at least partially, not rounding down more than 1 unit). The [comments](https://github.com/sherlock-audit/2024-05-pooltogether/blob/main/pt-v5-prize-pool/src/abstract/TieredLiquidityDistributor.sol#L565) are the source of truth, and the expected number is off
+> /// @notice Computes the expected number of prizes for a given number of tiers.
 
-The issue is made possible because the `tierLiquidity.prizeSize` is updated when a user calls `PrizePool::claimPrize()` via `TieredLiquidityDistributor::_getTier()` and `TieredLiquidityDistributor::_computePrizeSize()`. As shown below, the prize size returned is based on dividing the `remainingTierLiquidity` by `prizeCount` which is the <u>expected prize count (4^t)</u>, not the <u>actual prize count</u> for that draw and tier.
+The mentioned impact is true.
 
-https://github.com/sherlock-audit/2024-05-pooltogether/blob/main/pt-v5-prize-pool/src/abstract/TieredLiquidityDistributor.sol#L411-L429
+So unless a comment in the code or readme information is found that says rounding down more than 1 unit is okay, this issue is valid.
 
-```javascript
-  function _computePrizeSize(
-    uint8 _tier,
-    uint8 _numberOfTiers,
-    uint128 _tierPrizeTokenPerShare,
-    uint128 _prizeTokenPerShare
-  ) internal view returns (uint104) {
-    uint256 prizeCount = TierCalculationLib.prizeCount(_tier);
-    uint256 remainingTierLiquidity = _getTierRemainingLiquidity(
-      _tierPrizeTokenPerShare,
-      _prizeTokenPerShare,
-      _numShares(_tier, _numberOfTiers)
-    );
+**WangSecurity**
 
-    uint256 prizeSize = convert(
-@>    convert(remainingTierLiquidity).mul(tierLiquidityUtilizationRate).div(convert(prizeCount))
-    );
+> As long as they are roughly around their exact values, which they are in this case, the number of tiers will still increase/decrease to adapt to changing gas prices
 
-    return prizeSize > type(uint104).max ? type(uint104).max : uint104(prizeSize);
-  }
-```
+So in the example by @0x73696d616f if the expected number is 81, but the actual one is 80, the number of tiers can still increase/decrease based on gas conditions?
 
-Crucially, note that in the event there are less than the expected number of winners in a draw and tier, the protocol does not 'save' these extra prizes in reserves to protect against this issue ocurring in the future. It simply inflates that tier's liquidity for future draws. As shown above, in future draws `tierLiquidity.prizeSize` will be recalculated based on `remainingTierLiquidity` and `prizeCount`.
+> If the number of claimed prizes is 81, [> 80](https://github.com/sherlock-audit/2024-05-pooltogether/blob/main/pt-v5-prize-pool/src/abstract/TieredLiquidityDistributor.sol#L546), it will advance to tier 5.
+However, if the expected value was correctly calculated as 81, we would not advance to tier 5, but remain in tier 4.
 
-Also note there is no protection against this issue by ensuring the reserves exceed a sufficient size. At any point, the  `drawManager` can allocate any amount of the reserves to any address as a reward:
+Not sure if I understand it correctly, if expected is 80 and actual is 81, we increase to tier 5. If expected is 81 and actual is 81, we remain tier 4?
 
-https://github.com/sherlock-audit/2024-05-pooltogether/blob/main/pt-v5-prize-pool/src/PrizePool.sol#L434-L449
+**0x73696d616f**
 
-The risk of at least one prize being unclaimable is present in any draw where a tier's prize size `tierLiquidity.prizeSize` is greater than the reserve amount. Note that unless the value of the grand prize is kept in the reserve, the issue will be present in every single draw.
+To advance we need `actual >= expected`, because if `actual < expected` it [returns](https://github.com/sherlock-audit/2024-05-pooltogether/blob/main/pt-v5-prize-pool/src/abstract/TieredLiquidityDistributor.sol#L546) 4. And it also impacts the gas adaptation mechanism because the expected value is off.
 
+**MiloTruck**
 
-## Impact
+> So in the example by @0x73696d616f if the expected number is 81, but the actual one is 80, the number of tiers can still increase/decrease based on gas conditions?
 
-When `tierLiquidity.prizeSize` exceeds `TieredLiquidityDistributor._reserve`, and there are more winners than the expected number of winners, a race to call `PrizePool::claimPrize()` begins. In tier t, the first 4^t prize claims will be successful, with each subsequent call reverting.
+@WangSecurity My point is that the number of tiers will only need one more claim to increase, and there isn't really a difference between 80 claims VS 81 claims.
 
-Addresses that were entitled to a prize, but were not the first 4^t winning addresses to claim will <b><u>forfeit their prize</b></u>.
+There's a reason why the sponsor chose to dispute, and I believe it's because as long as the number of tiers increases at some point, regardless of at 80 or 81, the number of tiers will still increase/decrease based on gas conditions.
 
-## Code Snippet
+**0x73696d616f**
 
-The POC below was adapted from a test in `PrizePool.t.sol` and shows a scenario where five users can make a prize claim in tier 1 for a given draw. There is not enough liquidity for all users to claim, so the fifth claim reverts.
+it was not said anywhere that it is okay for the expected number to be off, so the hierarchy of truth holds and the 2 mentioned impacts are correct. The point is that the difference exceeds small amounts, as is the case in this [issue](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/28), where the shutdown still "works", but not in the right draw.
 
-Paste the following import and test in PrizePool.t.sol.
+**MiloTruck**
 
-```javascript
+> it was not said anywhere that it is okay for the expected number to be off, so the hierarchy of truth holds and the 2 mentioned impacts are correct. The point is that the difference exceeds small amounts, as is the case in this [issue](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/28), where the shutdown still "works", but not in the right draw.
 
-import { InsufficientLiquidity } from "../src/abstract/TieredLiquidityDistributor.sol";
+I don't see how #28 is relevant here, it's a completely different issue. 
 
-  function test_ClaimPrizesRevertsScenarioOne() public {
-    uint users = 50;
-    uint balance = 1e18;
-    uint totalSupply = users * balance;
-    uint8 t = 1; // Show revert in tier 1
-    uint256 yieldAmt = 100e18;
+Essentially it boils down to whether you believe the difference between 80 vs 81 claims is significant enough such that it affects the mechanism's ability to increase/decrease tiers according to gas prices. You believe the difference is significant while I (and I believe the sponsor?) don't. Will leave it to the judges to decide though, ultimately it's not up to us. 
 
-    // Vault contributes yield to prize pool
-    contribute(yieldAmt);
+**InfectedIsm**
 
-    // Draw is awarded with this random number
-    uint256 random = uint256(keccak256(abi.encode(1234)));
-    awardDraw(random);
+https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/95#issuecomment-2164066705
+> If the number of claimed prizes is 81, [> 80](https://github.com/sherlock-audit/2024-05-pooltogether/blob/main/pt-v5-prize-pool/src/abstract/TieredLiquidityDistributor.sol#L546), it will advance to tier 5.
+> However, if the expected value was correctly calculated as 81, we would not advance to tier 5, but remain in tier 4.
 
-    // Based on this seed, addresses, and TWAB values, Users 10, 15, 16, 18, and 41 win a prize in tier 1
-    address user10 = makeAddr(string(abi.encodePacked(uint(10))));
-    address user15 = makeAddr(string(abi.encodePacked(uint(15))));
-    address user16 = makeAddr(string(abi.encodePacked(uint(16))));
-    address user18 = makeAddr(string(abi.encodePacked(uint(18))));
-    address user41 = makeAddr(string(abi.encodePacked(uint(41))));
-    address user42 = makeAddr(string(abi.encodePacked(uint(42))));
+So, this simply shift the tier advancement to number of prize > 80 rather than 81 due to rounding in computation (which again isn't an issue, it can even sometimes used purposefully)
+The formula that the devs have chosen is arbitrary, as much as how they decided to implement it.
+They could have gone for any other formula to decide the limit of the tier expansion, which would have given another limit, could have been `t^5 + 1` or `t ^2 * 2 + t^4`, the main idea is to expand/contract the number of tier based by measuring how far from the expected odds of winning we are. 
 
-    // Mock user TWAB
-    mockTwabForUser(address(this), user10, t, balance);
-    mockTwabForUser(address(this), user15, t, balance);
-    mockTwabForUser(address(this), user16, t, balance);
-    mockTwabForUser(address(this), user18, t, balance);
-    mockTwabForUser(address(this), user41, t, balance);
-    mockTwabForUser(address(this), user42, t, balance);
+**0x73696d616f**
 
-    // Mock vault TWAB
-    mockTwabTotalSupply(address(this), t, totalSupply);
+The formula they picked is not arbitrary, it's the exact expected number of claims given that each prize has certain odds and claim count. It will be off due to rounding down.
 
-    // 5 Different users are able to claim prizes for this draw in tier 1
-    assertEq(prizePool.isWinner(address(this), user10, 1, 0), true);
-    assertEq(prizePool.isWinner(address(this), user15, 1, 2), true);
-    assertEq(prizePool.isWinner(address(this), user16, 1, 3), true);
-    assertEq(prizePool.isWinner(address(this), user18, 1, 0), true);
-    assertEq(prizePool.isWinner(address(this), user41, 1, 1), true);
+**WangSecurity**
 
-    // There is not enough liquidity for all 5 winners
-    assertGt(5 * prizePool.getTierPrizeSize(1), prizePool.getTierRemainingLiquidity(1) + prizePool.reserve());
+> The primary purpose of increasing/decreasing the number of tiers based on the number of prizes claimed is to adapt to fluctuating gas prices due to network congestion. When gas prices are cheap, more prizes will be claimed than the expected amount. The pool adapts to this by moving up one tier, thereby decreasing the rewards per prize as it will still be profitable to claim prizes with low gas costs
 
-    // Race condition is has been created, first 4 users can claim
-    assertEq(prizePool.getTierPrizeSize(1), prizePool.claimPrize(user10, 1, 0, user10, 0, address(this)));
-    assertEq(prizePool.getTierPrizeSize(1), prizePool.claimPrize(user15, 1, 2, user15, 0, address(this)));
-    assertEq(prizePool.getTierPrizeSize(1), prizePool.claimPrize(user16, 1, 3, user16, 0, address(this)));
-    assertEq(prizePool.getTierPrizeSize(1), prizePool.claimPrize(user18, 1, 0, user18, 0, address(this)));
+But in that case, if the expected number is off (not the one that should be due to rounding down), then the system won't adapt to fluctuating gas prices correctly and won't move up one tier when it needs to. Or it's wrong?
 
-    // Fifth user's claim reverts due to insufficient liquditiy
-    vm.expectRevert(abi.encodeWithSelector(InsufficientLiquidity.selector, prizePool.getTierPrizeSize(1)));
-    prizePool.claimPrize(user41, 1, 1, user41, 0, address(this));
-  }
-```
+I see that the rounding down is only by 1, but still in the edge case, expressed in the report, it lead to the protocol behaving in the incorrect way. 
 
-## Tool used
+Please tell me where I'm wrong.
 
-Manual Review
+And is it said anywhere that this expected number doesn't have to be the exact one?
 
-## Recommendation
+And a bit more info, sponsors setting "sponsor confirmed/disputed" and "won't/will fix" labels doesn't affect the final decision.
 
-Without changing the core logic of winner selection, my recommended mitigation falls into two categories:
+**0x73696d616f**
 
-  1. Waiting until the end of the claim period before calculating `tierLiquidity.prizeSize` and distributing pool tokens. This means the payout values for a given draw and tier will be based on the actual number of winners, not the expected number of winners. As an example, if two addresses were to win the grand prize on the same draw, they would each recieve half of the total grand prize.
-  This implementation would be more like a lottery where the total prize pool in each tier is guaranteed, but not the value of each winner's payout, this is only determined after the number of successful winners has been determined.
+@WangSecurity it will take 1 less claim than supposed to advance to the next tier, so the gas mechanism will not work as expected, you're right.
 
-  2. Managing the size of the reserve pool (`TieredLiquidityDistributor._reserve`) by taking steps to keep the reserve pool above some 'minimum reserve buffer':
+I could not find any mention that the expected number can be off and as the error exceeds small amounts, it's valid.
 
-- Requiring the reserve stays above the 'minimum reserve buffer' after each call to `prizePool::allocateRewardFromReserve()`
-- Bootstrapping reserve pool to the 'minimum reserve buffer' by temporarily increasing `TieredLiquidityDistributor.reserveShares` upon PrizePool deployment, or if reserve dips below 'minimum buffer'
-- For draws where the actual number of prize claims is less than the expected number, transfer the extra prizes to the reserve until the reserve pool exceed some 'minimum reserve buffer'.
-  
-    Note that the size of 'minimum reserve buffer' depends on the protocol's risk appetite for this issue arrising. To reduce the risk significantly, ideally the size of the reserve would exceed the liquidity available in tier 0. However the significant tradeoff is user's would recieve less yield because the reserve would need to grow in accordance with the grand prize pool. 
+**WangSecurity**
+
+With that, I agree that it's a valid issue cause if the expected number is incorrect, then the protocol cannot correctly adapt to gas prices, hence, won't expand tiers correctly, when it should.
+
+Planning to reject the escalation and leave the issue as it is.
+
+**Hash01011122**
+
+I agree with @MiloTruck and @InfectedIsm reasoning, this issue should be informational.
+
+There's no impact of this issue as pointed out by sponsors:
+>The existing algorithm returns the expected number of tiers based on claims. The calculation informs the rest of the system on the number of tiers. As long as the tiers can go up and down based on the network conditions, there is no unexpected consequence of the calculation rounding down.
 
 
 
 
+**0x73696d616f**
 
-## Discussion
+@Hash01011122 there is impact in the rewards distribution, and it was not documented that it's fine for the expected number to be incorrect.
+
+**Hash01011122**
+
+@0x73696d616f with all due respect, I don't see this as a valid issue. 
+
+**0x73696d616f**
+
+The reason you provided is based on information that was added post contest (that this is an acceptable bug), which has no weight.
+
+**WangSecurity**
+
+I still stand by my point stated above that in fact has impact and leads to the protocol adapting to gas prices incorrectly. The decision remains the same, planning to reject the escalation and leave the issue as it is.
+
+**WangSecurity**
+
+Result:
+Medium
+Unique
 
 **sherlock-admin4**
 
-1 comment(s) were left on this issue during the judging contest.
+Escalations have been resolved successfully!
 
-**infect3d** commented:
-> the PoC do not take the _reserve into account which exists for that specific purpose 
+Escalation status:
+- [MiloTruck](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/95/#issuecomment-2180708183): rejected
 
-
-
-**trmid**
-
-This is a well known limitation and design choice of the prize pool. As mentioned in the issue, the prize pool operates on a statistical model, awarding prizes based on tier odds. The prize pool offers two different tools for mitigating this variance:
-
-1. The reserve can be used to backstop "over-awarded" prizes with extra liquidity. This can be managed manually through the `contributeReserve` function, or automatically through the cut of contributions captured by the `reserveShares`. However, in recent deployments, the reserve is no longer needed for this purpose due to a new parameter:
-2. The `tierUtilizationRatio` can be configured such that the prizes only use a portion of the available yield in each prize tier. When configured correctly, this alone is enough to ensure that there will be enough liquidity for every prize within reasonable statistical variance. Although the absolute possibility of an over-awarded prize is not completely removed by this, the chance of a race condition can be brought so low such that there is no reasonable incentive for claimers to try and win the race. It is also worth noting that the most likely prizes to be over awarded are the smallest prizes in the system, therefore lowering impact of the condition even further.
-
-While the issue is valid, the prize pool already offers multiple configuration parameters to mitigate it such that any properly configured prize pool will not be significantly impacted.
-
-**nevillehuang**
-
-@trmid Was this design choice/limitation documented? If not I am leaning towards valid medium severity based on your comments above.
-
-# Issue M-12: Unfair Manipulation of Winning Chances Due to Stolen Yield on `Blast` 
+# Issue M-11: Unfair Manipulation of Winning Chances Due to Stolen Yield on `Blast` 
 
 Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/114 
 
@@ -2253,7 +2703,13 @@ The docs say the default for EOAs is rebasing, but the default for the contracts
 
 @elhajin You are right based on this [link here](https://docs.blast.io/building/guides/weth-yield). Seems like this is a valid issue.
 
-# Issue M-13: `Claimers` can receive less `feePerClaim` than they should if some prizes are already claimed or if reverts because of a reverting hook 
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/GenerationSoftware/pt-v5-prize-pool/pull/114
+
+
+# Issue M-12: `Claimers` can receive less `feePerClaim` than they should if some prizes are already claimed or if reverts because of a reverting hook 
 
 Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/124 
 
@@ -2444,7 +2900,17 @@ It's important for the claimers to simulate the results before claiming to ensur
 
 The impact of this issue is very low for competitive bots since claim simulations are commonly available and encouraged.
 
-# Issue M-14: The RNG finish draw auction rewards are overpaid due to missing to account for the time it takes to fulfill the Witnet randomness request 
+**InfectedIsm**
+
+Hey @nevillehuang, just noticed #57 is incorrectly duplicated with this finding.
+The submission do not show the fee calculation error, it simply tell that a user could claim the canary tier before prizes are claimed, which will increase the PrizePool.claimedCount counter, which is expected behavior. There is no reference about already claimed prizes which are still counted as claimed by the VRGDA.
+Sorry for not having noticed it before.
+
+**InfectedIsm**
+
+@WangSecurity can you check this please, it has been overlooked, thanks (I've shared 6 days ago that #57 is not a duplicate of this finding)
+
+# Issue M-13: The RNG finish draw auction rewards are overpaid due to missing to account for the time it takes to fulfill the Witnet randomness request 
 
 Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/126 
 
@@ -2556,7 +3022,7 @@ I realized I quoted the wrong parameter in my statement above:
 
 I meant to say `_auctionTargetTime` here instead of `_firstFinishDrawTargetFraction`.
 
-# Issue M-15: Witnet is not available on some networks listed 
+# Issue M-14: Witnet is not available on some networks listed 
 
 Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/127 
 
@@ -2625,7 +3091,95 @@ and the following sherlock guidelines:
 
 I believe this is a valid medium, if not it should have been made known as a known consideration
 
-# Issue M-16: `DrawManager.canStartDraw` does not consider retried RNG requests when determining if a new draw auction can be started 
+**10xhash**
+
+Escalate
+
+Witnet v2 is new. Even their documentation during the time of the contest was meant for V1 contracts clearly indicating that the integration is done considering the future. One of the chains mentioned ie. Zerion is/was not even public during the time of competition
+
+**sherlock-admin3**
+
+> Escalate
+> 
+> Witnet v2 is new. Even their documentation during the time of the contest was meant for V1 contracts clearly indicating that the integration is done considering the future. One of the chains mentioned ie. Zerion is/was not even public during the time of competition
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**InfectedIsm**
+
+> Escalate
+> 
+> Witnet v2 is new. Even their documentation during the time of the contest was meant for V1 contracts clearly indicating that the integration is done considering the future. One of the chains mentioned ie. Zerion is/was not even public during the time of competition
+
+Also I reiterate that the documentation is crystal clear regarding the fact that this is known by the devs :
+
+> The startDraw auction process **may be slightly different on each chain and depends on the RNG source that is being used for the prize pool**. For example, Witnet is used on the Optimism deployment and can be started by calling the startDraw function on the RngWitnet contract associated with that deployment. Check the deployment contracts for each chain to see which RNG source is being used.
+
+clearly indicating that the devs are well aware that the source will depend on the chain they deploy. 
+This is like reading the doc saying "we know that we will have to select the RNG source depending on the chain we will deploy" and telling the devs "hey devs, be careful there are chain where Witnet is not available", I think we can do better than that.
+
+**nevillehuang**
+
+By hierachy of truth escalations should be rejected.
+
+> If the protocol team provides specific information in the README or CODE COMMENTS, that information stands above all judging rules.
+
+**WangSecurity**
+
+I agree with the lead judge here and this warrants medium severity based on [this](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/127#issuecomment-2170422787) comment. I see that the protocol's docs say "The startDraw auction process may be slightly different on each chain and depends on the RNG source that is being used for the prize pool", but based on README this issue has to be valid.
+
+Planning to reject the escalation and leave the issue as it is.
+
+**10xhash**
+
+> I agree with the lead judge here and this warrants medium severity based on [this](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/127#issuecomment-2170422787) comment. I see that the protocol's docs say "The startDraw auction process may be slightly different on each chain and depends on the RNG source that is being used for the prize pool", but based on README this issue has to be valid.
+> 
+> Planning to reject the escalation and leave the issue as it is.
+
+"if not it should have been made known as a known consideration", as said in my previous comment, this would be an obviously known issue to the team given witnetv2 is still rolling out. And how is this assigned a medium severity? I have submitted this same issue as an informational issue here https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/169 because at best it is just providing information which the sponsor would have realized before deployment anyways
+
+**WangSecurity**
+
+The reason why this is assigned medium severity is because the sponsor specifically asked if their contracts can be deployed on any chain as-is. This issue doesn't allow for such deployment. Hence, it's medium severity, cause the sponsor specifically asked for this.
+
+The decision remains the same, planning to reject the escalation and leave the issue as it is.
+
+**10xhash**
+
+> The reason why this is assigned medium severity is because the sponsor specifically asked if their contracts can be deployed on any chain as-is. This issue doesn't allow for such deployment. Hence, it's medium severity, cause the sponsor specifically asked for this.
+> 
+> The decision remains the same, planning to reject the escalation and leave the issue as it is.
+
+If taking the context into the consideration (rolling out v2, outdated docs, no publicly available source of truth for which chains v2 is deployed etc.), it becomes clear that the sponsor is well aware of the state of witnet and is asking for specific chain related issues and not of the existence of witnet v2 in chains
+
+It would be using sponsor's words too literally and if that is the case I would like to know if the issue "zerion chain is not live and hence contracts cannot be deployed" would also be a valid medium severity issue?
+
+**WangSecurity**
+
+I understand that it's obvious, but still the sponsor asked if the protocol can be deployed without any issues, and this issue shows that there would be. And it's valid because the protocol asked about it in README.
+
+About Zerion, I would say this is invalid, because there would be nowhere to deploy, while in this case you can deploy the contracts, but they won't function correctly.
+
+Hope that answers your question, planning to reject the escalation and leave the issue as it is.
+
+**WangSecurity**
+
+Result:
+Medium
+Has duplicates
+
+**sherlock-admin4**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [10xhash](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/127/#issuecomment-2181010662): rejected
+
+# Issue M-15: `DrawManager.canStartDraw` does not consider retried RNG requests when determining if a new draw auction can be started 
 
 Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/129 
 
@@ -2677,7 +3231,7 @@ Manual Review
 
 Consider using the last request's `closedAt` timestamp instead of `drawClosesAt` to determine if the auction has expired to consider failed RNG requests that have been retried by calling `startDraw` again.
 
-# Issue M-17: User's might be able to claim their prizes even after shutdown 
+# Issue M-16: User's might be able to claim their prizes even after shutdown 
 
 Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/133 
 
@@ -2852,7 +3406,276 @@ Manual Review
 ## Recommendation
 Add a notShutdown modifier to the claimPrize function
 
-# Issue M-18: `maxDeposit` doesn't comply with ERC-4626 
+
+
+## Discussion
+
+**0xjuaan**
+
+Escalate
+
+This issue is informational
+
+This issue requires the following to be true as stated by the watson
+>In case the draw period is different from the TWAB's period length.....
+
+The draw period and TWAB's period length are both set by the protocol themselves so setting this incorrectly will be admin error and considered invalid
+
+By looking at the test suite we can clearly see that draw period = TWAB's period length == 1 day
+
+**sherlock-admin3**
+
+> Escalate
+> 
+> This issue is informational
+> 
+> This issue requires the following to be true as stated by the watson
+> >In case the draw period is different from the TWAB's period length.....
+> 
+> The draw period and TWAB's period length are both set by the protocol themselves so setting this incorrectly will be admin error and considered invalid
+> 
+> By looking at the test suite we can clearly see that draw period = TWAB's period length == 1 day
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**10xhash**
+
+Escalate
+
+The issue allows the winners to claim the rewards twice which causes other user's to loose their prizes which I think should warrant high severity
+
+
+**sherlock-admin3**
+
+> Escalate
+> 
+> The issue allows the winners to claim the rewards twice which causes other user's to loose their prizes which I think should warrant high severity
+> 
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**nevillehuang**
+
+@trmid @10xhash Might want to take a look at this [comment](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/133#issuecomment-2180371308). If not I rated it medium given the unlikely likelihood of shutdown mentioned in comments [here](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/36#issuecomment-2167042765).
+
+**0x73696d616f**
+
+I believe for this to happen, 2 things must be considered:
+- The draw length must be different than the twab length.
+- The shutdown is caused by the end of the twab controller, in 82 years.
+
+Given these extensive limitations, medium is appropriate.
+If the shutdown happens due to the rng service, it ends at the end of the draw so prizes can not be claimed and this issue does not exist.
+
+**10xhash**
+
+> @trmid @10xhash Might want to take a look at this [comment](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/133#issuecomment-2180371308). If not I rated it medium given the unlikely likelihood of shutdown mentioned in comments [here](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/36#issuecomment-2167042765).
+
+It is a not an incorrect setting. 
+The requirements for the draw period are that:
+```solidity
+    if (
+      params.drawPeriodSeconds < twabPeriodLength ||
+      params.drawPeriodSeconds % twabPeriodLength != 0
+    ) {
+      revert IncompatibleTwabPeriodLength();
+    }
+```  
+https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-prize-pool/src/PrizePool.sol#L357-L362
+
+In the sponsors [comment](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/36#issuecomment-2167042765), it is mentioned that the case of `the TWAB timestamps have reached their max limit` is being explicitly considered which is the scenario discussed here 
+```
+The second is guaranteed to happen at the end of life for a TWAB controller and was a major consideration in the design of the shutdown logic
+```
+
+**WangSecurity**
+
+Since there's a set of inputs that doesn't result in an issue, we should consider this set will be used by the protocol team. Planning to accept the escalation and invalidate the issue, cause as I understand there won't be an issue when TWAB and draw periods are the same.
+
+**10xhash**
+
+> Since there's a set of inputs that doesn't result in an issue, we should consider this set will be used by the protocol team. Planning to accept the escalation and invalidate the issue, cause as I understand there won't be an issue when TWAB and draw periods are the same.
+
+How is it considered that the protocol will be using drawPeriod == TWABperiod when the code clearly has other rules to determine whether a drawPeriod is compatible or not?
+```solidity
+    if (
+      params.drawPeriodSeconds < twabPeriodLength ||
+      params.drawPeriodSeconds % twabPeriodLength != 0
+    ) {
+      revert IncompatibleTwabPeriodLength();
+    }
+```
+
+**WangSecurity**
+
+If there are values set by admins and only specific set causes issues, then it's considered an admin mistake to set values to cause issues. But, looking at this issue and the code again, I agree it wouldn't be a mistake, cause draw period can be any multiple of TWAB period length. Hence, I agree this scenario is indeed possible.
+
+Planning to reject the escalation and leave the issue as it is.
+
+**10xhash**
+
+> If there are values set by admins and only specific set causes issues, then it's considered an admin mistake to set values to cause issues. But, looking at this issue and the code again, I agree it wouldn't be a mistake, cause draw period can be any multiple of TWAB period length. Hence, I agree this scenario is indeed possible.
+> 
+> Planning to reject the escalation and leave the issue as it is.
+
+I had raised an [escalation](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/133#issuecomment-2181094863) to reconsider the severity of the issue as high which I don't think have been addressed/considered. Can you please look into it
+
+**WangSecurity**
+
+In the escalation message you say the user is able to claim the prize twice, you mean claim the prize before the shutdown and after the shutdown if the current draw haven't been finalised. Or by that you mean claim the prize and withdraw their share of the shutdown balance?
+
+**10xhash**
+
+> mean claim the prize and withdraw their share of the shutdown balance?
+
+"claim the prize and withdraw their share of the shutdown balance?" this. Sorry for the incorrectness there
+
+**WangSecurity**
+
+Then I agree it should be high. Yes, only the winners can do it, but any winner can do it without any extensive limitations. Planning to reject @0xjuaan escalation since the issue should remain valid. Planning to accept @10xhash's escalation and upgrade severity to high.
+
+**0x73696d616f**
+
+@WangSecurity what are your thoughts on these 2 [points](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/133#issuecomment-2182584320)? The parameter being a specific one and the issue happening in 82 years are extensive limitations (we will never witness it, or there is a 0.0000001% chance). Agree that the sponsor saying they care about the shutdown makes the issue in scope, but high for a issue that will not happen seems too much.
+
+**WangSecurity**
+
+Thank you and excuse me, TWAB limit is always 82 years, correct? And if the shutdown happens due to draw timeout has been reached, then this issue won't happen?
+
+**0x73696d616f**
+
+@WangSecurity I think it does not happen due to the draw timeout, look at the following links to confirm.
+
+Shutdown [check](https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-prize-pool/src/PrizePool.sol#L968)
+
+`shutdownAt()` returns [drawTimeoutAt](https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-prize-pool/src/PrizePool.sol#L962)
+
+[drawTimeoutAt](https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-prize-pool/src/PrizePool.sol#L974)
+
+[drawClosesAt](https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-prize-pool/src/PrizePool.sol#L838)
+
+On the other hand, the twab controller [timeout](https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-prize-pool/src/PrizePool.sol#L960),  [lastObservationAt()](https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-twab-controller/src/TwabController.sol#L190), [returns](https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-twab-controller/src/libraries/TwabLib.sol#L289) approx 82 years in the future (type(uint32).max).
+
+**WangSecurity**
+
+And if it can't happen at the draw timeout, because in that case the last draw would have been finalised, and this issue requires the opposite, correct?
+
+Moreover, is it guaranteed that when TWAB limit is reached, there would be a not finalised draw, or it depends on configuration?
+
+**0x73696d616f**
+
+> And if it can't happen at the draw timeout, because in that case the last draw would have been finalised, and this issue requires the opposite, correct?
+
+Yes
+
+> Moreover, is it guaranteed that when TWAB limit is reached, there would be a not finalised draw, or it depends on configuration?
+
+Depends on config, the period length of the twab controller needs to be different than that of the prize pool for them to end at different timestamps and cause this issue
+
+**WangSecurity**
+
+Thank you for this clarifications, then I would agree this is a high constraint, and even though any winner in this case can steal funds, the TWAB period length of 82 years has to be reached, which may never happen due to draw timeout shutdown. Hence, I agree indeed medium severity should remain.
+
+Planning to reject both escalation and leave the issue as it is.
+
+**10xhash**
+
+> Thank you for this clarifications, then I would agree this is a high constraint, and even though any winner in this case can steal funds, the TWAB period length of 82 years has to be reached, which may never happen due to draw timeout shutdown. Hence, I agree indeed medium severity should remain.
+> 
+> Planning to reject both escalation and leave the issue as it is.
+
+Here the project is especially considering this scenario of the max time reaching ie.type(uint32).max. And the other constraint of draw period length being not equal to the twab period length is also not a constraint as such. Both of these are values/situations that are supposed to be handled by the contract 
+
+**WangSecurity**
+
+I agree that the draw period being not equal to the TWAB period length is not an extensive constraint. But I believe reaching the TWAB period length of 82 years without a draw timeout, is quite a high constraint. Moreover, this scenario may never occur. Hence, I believe medium is more appropriate.
+
+The decision remains the same, reject both escalations and leave the issue as it is.
+
+**10xhash**
+
+> I agree that the draw period being not equal to the TWAB period length is not an extensive constraint. But I believe reaching the TWAB period length of 82 years without a draw timeout, is quite a high constraint. Moreover, this scenario may never occur. Hence, I believe medium is more appropriate.
+> 
+> The decision remains the same, reject both escalations and leave the issue as it is.
+
+A draw timeout would occur when the protocol is non-operational ie. the bots refuse to award draws. The team wants to consider this project to be work correctly even after 82 years. I am reiterating the comment of the sponsor:
+```
+The second is guaranteed to happen at the end of life for a TWAB controller and was a major consideration in the design of the shutdown logic
+```   
+It is different if the project simply decides to not handle the scenario after type(uint32).max and if the project explicitly wants to handle the scenario after this time period.
+It is upto the team to decide which timeframe they want to provide support for and if they want the timeframe to be even 1000 years, it shouldn't be considered as a limitation.    
+
+**WangSecurity**
+
+I understand that this is the scenario the protocol wants to cover, but this doesn't change the fact that 82 years is quite long and there are others reasons why the vault may shutdown before this 82 years expire. Hence, I believe the medium is more appropriate. I don't mean to say this is invalid, or not of importance, but I see it as an extensive limitation, because of which this issue may never arise.
+
+Hence, the decision remains the same, planning to reject both escalation and leave the issue medium as it is.
+
+**10xhash**
+
+From sherlocks docs, criteria for high:
+```
+Definite loss of funds without (extensive) limitations of external conditions
+```
+If the protocol plans to operate past 82 years, is that timeframe still considered under extensive limitation of external condition?
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/GenerationSoftware/pt-v5-prize-pool/pull/116
+
+
+**WangSecurity**
+
+I see that the protocol plans to operate for 82 years, but given the fact, that it's a very long timeframe and other reasons can cause shutdown before it and won't cause this issue, medium is more appropriate. It's not based only on the fact that the TWAB limit is 82 years, but on the combination of factors.
+
+The decision remains the same, planning to reject both escalation and leave the issue as it is.
+
+**10xhash**
+
+> I see that the protocol plans to operate for 82 years, but given the fact, that it's a very long timeframe and other reasons can cause shutdown before it and won't cause this issue, medium is more appropriate. It's not based only on the fact that the TWAB limit is 82 years, but on the combination of factors.
+> 
+> The decision remains the same, planning to reject both escalation and leave the issue as it is.
+
+There is one other reason due to which the protocol can shutdown and that is if the draw is not awarded for a time period of drawTimeOut. If the protocol is assumed to operate 82 yrs, isn't it trivial that it is also assumed that the bots will continue to draw awards during this period
+
+**WangSecurity**
+
+I still believe that medium severity is more appropriate here, based on the same reasons as [here](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/133#issuecomment-2198102514).
+
+The decision remains the same, planning to reject both escalations and leave the issue as it is.
+
+**10xhash**
+
+> I still believe that medium severity is more appropriate here, based on the same reasons as [here](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/133#issuecomment-2198102514).
+> 
+> The decision remains the same, planning to reject both escalations and leave the issue as it is.
+
+ok. I have no more points to make
+
+**WangSecurity**
+
+Result:
+Medium
+Has duplicates
+
+**sherlock-admin3**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [0xjuaan](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/133/#issuecomment-2180371308): rejected
+- [10xhash](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/133/#issuecomment-2181094863): rejected
+
+# Issue M-17: `maxDeposit` doesn't comply with ERC-4626 
 
 Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/134 
 
@@ -2935,7 +3758,13 @@ Valid medium since it was mentioned as:
 Sherlock rules states
 > The protocol team can use the README (and only the README) to define language that indicates the codebase's restrictions and/or expected functionality. Issues that break these statements, irrespective of whether the impact is low/unknown, will be assigned Medium severity
 
-# Issue M-19: `maxRedeem` doesn't comply with ERC-4626 
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/GenerationSoftware/pt-v5-vault/pull/113
+
+
+# Issue M-18: `maxRedeem` doesn't comply with ERC-4626 
 
 Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/136 
 
@@ -3055,79 +3884,31 @@ Valid medium since it was mentioned as:
 Sherlock rules states
 > The protocol team can use the README (and only the README) to define language that indicates the codebase's restrictions and/or expected functionality. Issues that break these statements, irrespective of whether the impact is low/unknown, will be assigned Medium severity
 
-# Issue M-20: User's might be able to add already errored witnet requests on L2's 
+**InfectedIsm**
 
-Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/154 
+@nevillehuang @WangSecurity I think you didn't take my judging comment into consideration, sorry for acting so late.
 
-The protocol has acknowledged this issue.
+If `totalAssets == 0`, this means `totalDebt == 0` too as:
+- at start, the [prize vault gets assets deposited](https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-vault/src/PrizeVaultFactory.sol#L120) as the yield buffer so `totalAssets > 0`
+- debt is minted 1:1 with deposited assets, so `TotalAssets > TotalDebt` during the existence of the vault
+- when yield is accrued, TotalAssets is increased, while debt is as most increased up to totalAssets for yield to be liquidated
+- when the Yield Vault take a loss for any reason, then assets<debt, a user withdrawing at this moment `shares (debt) burned > asset withdrawn`, until `debt = assets`
+- This means, if `totalAssets == 0`, then `totalDebt == 0` too
 
-## Found by 
-hash
-## Summary
-User's might be able to add already errored witnet requests on L2's 
+Hence, this is the case `if (_totalAssets >= _totalDebt)` that is executed, and not the `else` case, so no division by 0 here.
 
-## Vulnerability Detail
-`block.number` of L2's like Arbitrum return Ethereum's block number but [lagged](https://docs.arbitrum.io/build-decentralized-apps/arbitrum-vs-ethereum/block-numbers-and-time#ethereum-block-numbers-within-arbitrum). Currently it is synced approximately every minute but is recommended to be only relied on a scale of hours. 
-The current best time possible for witnet to report is 3 minutes (usually reported in 5-10 mins) and the wit/2 upgrade will (most likely) [decrease block time](https://discord.com/channels/492453503390842880/1154045538900115456/1247216363961843733). 
-In such a case blocks could occur such that the rngRequest made at `block.number` is reported in the same block with `ERROR` as the status. 
-Since no checks are made for the request status inside `startDraw` for the new request id, a user can add such a request and earn additional reward without any useful work
+The only case where this could happen is a yield vault being hacked and fully withdrawn from its asset, and the yield buffer of the prize vault fully emptied
+If this cannot happen in normal circonstances (yield vault compliant, so no way to get hacked) then we should consider this case cannot happen, so the function cannot revert.
 
-## Impact
-User can claim reward without actually contributing to obtaining the random number
+@10xhash FYI
 
-## Code Snippet
-https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-draw-manager/src/DrawManager.sol#L219-L225
+**sherlock-admin2**
 
-## Tool used
-Manual Review
-
-## Recommendation
-Check if the status is `ERROR` before adding a request
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/GenerationSoftware/pt-v5-vault/pull/112
 
 
-
-## Discussion
-
-**sherlock-admin3**
-
-1 comment(s) were left on this issue during the judging contest.
-
-**infect3d** commented:
-> invalid__ I deployed a contract on arbitrum and the delay is at most 1 block from mainnet
-
-
-
-**trmid**
-
-Not sure I understand the exploit here, but it sounds like this block number check would prevent any RNG reuse if it's somehow returned in the same block number: https://github.com/sherlock-audit/2024-05-pooltogether/blob/1aa1b8c028b659585e4c7a6b9b652fb075f86db3/pt-v5-draw-manager/src/DrawManager.sol#L225
-
-**nevillehuang**
-
-@10xhash Could you take a look at the above comment? This seems invalid given you cannot re-use a random number within the same block. 
-
-**10xhash**
-
-It is not about re-use. If witnet returns in the same block.number and its status is `ERROR`, then that request could still be added because no-check is kept on the status of the request 
-
-**nevillehuang**
-
-@10xhash Would'nt this be OOS?
-
-> The core protocol integration is the random number generator, Witnet. This is a trusted integration and you can assume they are always responsive.
-
-Also is there a reference code logic I can take a look so I can determine the possibility of the status returning Error?
-
-**10xhash**
-
-`Error` is a possible state of the query in witnet
-
-https://github.com/witnet/witnet-solidity-bridge/blob/4d1e464824bd7080072eb330e56faca8f89efb8f/contracts/data/WitnetOracleDataLib.sol#L69-L79
-
-**trmid**
-
-I don't see why this should be treated differently than the normal retry logic. If Witnet returns an Error response, then that request has failed and a new RNG request should be attempted if there is still time available to do so in the draw.
-
-# Issue M-21: Users can setup hooks to control the expannsion of tiers 
+# Issue M-19: Users can setup hooks to control the expannsion of tiers 
 
 Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/162 
 
@@ -3235,7 +4016,133 @@ This is permissionless and powerful!
 
 *One dev's bug is another dev's feature.*
 
-# Issue M-22: Gas Manipulation by Malicious Winners in claimPrizes Function 
+**0xjuaan**
+
+Escalate
+
+**The following is the criteria for medium severity issues**
+
+1. Causes a loss of funds but requires certain external conditions or specific states, or a loss is highly constrained. The losses must exceed small, finite amount of funds, and any amount relevant based on the precision or significance of the loss.
+2. Breaks core contract functionality, rendering the contract useless or leading to loss of funds.
+
+This issue is informational
+
+The impact of this issue as described by the watson is
+>User's have control over the expansion of tiers
+
+This does not lead to loss of funds AND does not break core contract functionality. Therefore the issue does not satisfy sherlock's requirements for medium severity
+
+**sherlock-admin3**
+
+> Escalate
+> 
+> **The following is the criteria for medium severity issues**
+> 
+> 1. Causes a loss of funds but requires certain external conditions or specific states, or a loss is highly constrained. The losses must exceed small, finite amount of funds, and any amount relevant based on the precision or significance of the loss.
+> 2. Breaks core contract functionality, rendering the contract useless or leading to loss of funds.
+> 
+> This issue is informational
+> 
+> The impact of this issue as described by the watson is
+> >User's have control over the expansion of tiers
+> 
+> This does not lead to loss of funds AND does not break core contract functionality. Therefore the issue does not satisfy sherlock's requirements for medium severity
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**nevillehuang**
+
+@10xhash What is the impact of your PoC mentioned [here](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/162#issuecomment-2166728531)?
+
+**10xhash**
+
+> @10xhash What is the impact of your PoC mentioned [here](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/162#issuecomment-2166728531)?
+
+User's can revert specifically on prize claims occurring for canary tiers. The expansion of tiers (number of tiers determine the size and the number of prizes) is based on whether the canary tier prizes are claimed or not and hence this allows user's to influence it without any loss to them (since they gain nothing from a canary tier claim)
+
+**WangSecurity**
+
+To clarify, the attack is pretty much the same as for the issue from C4 audit, but here it doesn't allow to bypass the fees but to prevent the expansion of tiers?
+
+And about the impact, this allows users to increase their chance of winning, or just the size and number of prizes are smaller (i.e. what is the benefit for the attacker to control expansion of tiers or loss to others?).
+
+**10xhash**
+
+> To clarify, the attack is pretty much the same as for the issue from C4 audit, but here it doesn't allow to bypass the fees but to prevent the expansion of tiers?
+> 
+> And about the impact, this allows users to increase their chance of winning, or just the size and number of prizes are smaller (i.e. what is the benefit for the attacker to control expansion of tiers or loss to others?).
+
+Yes
+
+It doesn't improve a user's chance of winning directly. If some user's want to have a specific distribution of prizes (eg: instead of distributing prizes more frequently, they want to have a large yearly prize), they can influence to achieve this    
+
+**Hash01011122**
+
+**Attack Vector:** But as mitigation, the contract will revert. But this still allows the user's to specifically revert on just the last canary tiers in order to always prevent the expansion of the tiers
+
+**Impact:** User's have control over the expansion of tiers
+
+As pointed out by @0xjuaan this issue has no impact on protocol whatsoever. This should be considered as low/info issue.
+
+Another point to note from the sponsors comment:
+>One dev's bug is another dev's feature.
+
+This is a design choice of protocol and can be invalidated. 
+
+@nevillehuang @WangSecurity Do correct me if I am wrong 
+
+**WangSecurity**
+
+Firstly, as I understand, it's not a design decision, but an acceptable risk, which was not documented (this is confirmed). Secondly, I believe it allows the users to control tiers to their needs, an examples is given by the submitter [here](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/162#issuecomment-2186954689). Since, it wasn't documented as acceptable, and gives users more control than they should have, which I believe breaks core contract functionality. But if it's incorrect please correct me.
+
+Planning to reject the escalation and leave the issue as it is.
+
+**Hash01011122**
+
+@WangSecurity I guess you are getting the escalation wrong, even if we overlook the fact of design choice then there isn't any direct impact nor breakage of core functionality.
+
+>If some user's want to have a specific distribution of prizes (eg: instead of distributing prizes more frequently, they want to have a large yearly prize), they can influence to achieve this.
+
+Users can influence it in some cases to benefit from it increasing their odds, this doesn't qualify as direct impact.
+
+This is low/info severity issue.
+
+**WangSecurity**
+
+As I understand it indeed has impact, the user is able to control distribution of prizes (i.e. get a large yearly prize instead of frequent prizes), when they shouldn't be able to. And it wasn't the design, hence, I see it as a valid issue. 
+
+The decision remains the same, planning to reject the escalation and leave the issue as it is.
+
+**Hash01011122**
+
+@10xhash @trmid What large yearly prize instead of frequent prizes will account to? In terms of loss incurred? Also given the timeframe wouldn't protocol notice it and can redeploy tier contracts? And why this isn't design choice and acceptable risk @WangSecurity, because codebase is clearly designed the way @trmid pointed out.
+
+**WangSecurity**
+
+I still believe that this is a vulnerability because the users gain control that they shouldn't have and can prevent the expansion of tiers. It will have rather a long-term effect and can lead to this user getting more wins than they should've if they hadn't this control.
+
+I can confirm it's not a design decision and it's still the same issue as it was in the previous audit, but the impact is lower. It's not an acceptable risk because it wasn't put in a special field in the README and given the fact that the sponsors view it as good, rather than bad, doesn't mean we have to straight invalidate it.
+
+The decision remains the same, planning to reject the escalation and leave the issue as it is.
+
+**WangSecurity**
+
+Result:
+Medium
+Unique
+
+**sherlock-admin4**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [0xjuaan](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/162/#issuecomment-2180362299): rejected
+
+# Issue M-20: Gas Manipulation by Malicious Winners in claimPrizes Function 
 
 Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/163 
 
@@ -3261,4 +4168,55 @@ A malicious winner can exploit the `claimPrizes` function in the `Claimer` contr
 
 - Implement a gas limit check to ensure that sufficient gas remains for the rest of the claims after catching a revert.
 - Consider adding a mechanism to penalize or blacklist addresses that attempt to exploit this vulnerability.
+
+
+
+## Discussion
+
+**InfectedIsm**
+
+Escalate
+
+issue #110 doesn't talk about gas bomb through return data, and shouldn't be a duplicate of this issue.
+If there's an issue that could be seen as similar, it would be #73, as in that one the attacker steal the reward that was attributed to the original claimer
+
+**sherlock-admin3**
+
+> Escalate
+> 
+> issue #110 doesn't talk about gas bomb through return data, and shouldn't be a duplicate of this issue.
+> If there's an issue that could be seen as similar, it would be #73, as in that one the attacker steal the reward that was attributed to the original claimer
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**nevillehuang**
+
+Escalation should be rejected, watson didn't pay attention to the correct duplication. #110 is already duplicated to #73
+
+**WangSecurity**
+
+Agree with the Lead Judge, planning to reject the escalation and leave the issue as it is.
+
+**WangSecurity**
+
+Result:
+Medium
+Has duplicates
+
+**sherlock-admin4**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [InfectedIsm](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/163/#issuecomment-2181063305): rejected
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/GenerationSoftware/pt-v5-vault/pull/115
+
 
