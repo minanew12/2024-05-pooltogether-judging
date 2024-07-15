@@ -60,6 +60,15 @@ The protocol team fixed this issue in the following PRs/commits:
 https://github.com/GenerationSoftware/pt-v5-prize-pool/pull/115
 
 
+**10xhash**
+
+Fixed. 
+Now the max range of draws to look for is limited to `grandPrizePeriodDraws`
+
+**sherlock-admin2**
+
+The Lead Senior Watson signed off on the fix.
+
 # Issue H-2: Unfair Manipulation of Winning Chances Due to Stolen Yield on `Blast` 
 
 Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/114 
@@ -209,6 +218,15 @@ The protocol team fixed this issue in the following PRs/commits:
 https://github.com/GenerationSoftware/pt-v5-prize-pool/pull/114
 
 
+**10xhash**
+
+Fixed 
+Now WETH is configured claimable and is donated
+
+**sherlock-admin2**
+
+The Lead Senior Watson signed off on the fix.
+
 # Issue H-3: Draw auction rewards likely exceed the available rewards, resulting in overpaying rewards or running into an `InsufficientReserve` error 
 
 Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/125 
@@ -341,6 +359,21 @@ The prize pool uses part of the yield generation (the reserve) to incentivize th
 
 This issue is assuming that there are not enough incentives for the RNG auctions to provide profitable payouts, therefore `medium` seems more appropriate:
 > Causes a loss of funds but requires certain external conditions or specific states, or a loss is highly constrained. The losses must exceed small, finite amount of funds, and any amount relevant based on the precision or significance of the loss.
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/GenerationSoftware/pt-v5-draw-manager/pull/18
+
+
+**10xhash**
+
+Fixed with https://github.com/GenerationSoftware/pt-v5-draw-manager/pull/17 and https://github.com/GenerationSoftware/pt-v5-draw-manager/pull/18
+Now the max reward is limited to remaining fraction after the other rewards are considered  
+
+**sherlock-admin2**
+
+The Lead Senior Watson signed off on the fix.
 
 # Issue M-1: Draws can be retried even if a random number is available or the current draw has finished 
 
@@ -531,6 +564,15 @@ The protocol team fixed this issue in the following PRs/commits:
 https://github.com/GenerationSoftware/pt-v5-rng-witnet/pull/8
 
 
+**10xhash**
+
+Fixed
+Now the exact request has to be solved for the query to be considered complete (instead of isRandomized returning true) disallowing a request to exist as both failed and complete at the same time 
+
+**sherlock-admin2**
+
+The Lead Senior Watson signed off on the fix.
+
 # Issue M-2: `drawTimeoutAt()` causes the prize pool to shutdown one draw earlier 
 
 Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/28 
@@ -710,6 +752,15 @@ Escalation status:
 The protocol team fixed this issue in the following PRs/commits:
 https://github.com/GenerationSoftware/pt-v5-prize-pool/pull/117
 
+
+**10xhash**
+
+Fixed
+Documentation is updated to `draws that can pass` from `draws that can be missed` to match with the implementation and a minimum value of 2 draws is enforced
+
+**sherlock-admin2**
+
+The Lead Senior Watson signed off on the fix.
 
 # Issue M-3: Price formula in `TpdaLiquidationPair._computePrice()` does not account for a jump in liquidatable balance 
 
@@ -1250,6 +1301,15 @@ The protocol team fixed this issue in the following PRs/commits:
 https://github.com/GenerationSoftware/pt-v5-claimer/pull/32
 
 
+**10xhash**
+
+Fixed. 
+Now re-entrancy guard is added to to the Claimer contract which disallows claiming prizes by reentering through the same claimer contract. If in future vaults are launched with a different claimer contract and bots attempt to claim prizes for both these vaults in the same tx, then the same issue would arise again
+
+**sherlock-admin2**
+
+The Lead Senior Watson signed off on the fix.
+
 # Issue M-6: `PUSH0` opcode Is Not Supported on Linea yet 
 
 Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/79 
@@ -1606,6 +1666,21 @@ Escalations have been resolved successfully!
 
 Escalation status:
 - [InfectedIsm](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/80/#issuecomment-2177993820): rejected
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/GenerationSoftware/pt-v5-rng-witnet/pull/9
+
+
+**10xhash**
+
+Fixed. 
+Now .call is used instead of .transfer
+
+**sherlock-admin2**
+
+The Lead Senior Watson signed off on the fix.
 
 # Issue M-8: Claimers Cannot Claim Prizes When Last Tier Liquidity is 0, Preventing Winners from Receiving Their Prizes 
 
@@ -2065,6 +2140,21 @@ Escalations have been resolved successfully!
 Escalation status:
 - [0xjuaan](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/84/#issuecomment-2180798532): accepted
 
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/GenerationSoftware/pt-v5-claimer/pull/34
+
+
+**10xhash**
+
+Fixed in https://github.com/GenerationSoftware/pt-v5-claimer/pull/33 and https://github.com/GenerationSoftware/pt-v5-claimer/pull/34
+Now the VRGDA is run with 100% maxFee as the auction's high price. In case the targetFee is 0, it is set to 1% of maxFee  
+
+**sherlock-admin2**
+
+The Lead Senior Watson signed off on the fix.
+
 # Issue M-9: DoSed liquidations as `PrizeVault::liquidatableBalanceOf()` does not take into account the `mintLimit` when the token out is the asset 
 
 Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/88 
@@ -2426,6 +2516,15 @@ Escalation status:
 **nevillehuang**
 
 @WangSecurity Not as far as I know.
+
+**10xhash**
+
+Fixed. 
+Now the amount is restricted such that the corresponding fee minted will fall within the mint limit
+
+**sherlock-admin2**
+
+The Lead Senior Watson signed off on the fix.
 
 # Issue M-10: Estimated prize draws in TieredLiquidityDistributor are off due to rounding down when calculating the sum, leading to incorrect prizes 
 
@@ -3247,6 +3346,15 @@ The protocol team fixed this issue in the following PRs/commits:
 https://github.com/GenerationSoftware/pt-v5-draw-manager/pull/15
 
 
+**10xhash**
+
+Fixed. 
+Now the lastStartDrawAuction.closedAt is used incase there are failed requests
+
+**sherlock-admin2**
+
+The Lead Senior Watson signed off on the fix.
+
 # Issue M-15: User's might be able to claim their prizes even after shutdown 
 
 Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/133 
@@ -3691,6 +3799,15 @@ Escalation status:
 - [0xjuaan](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/133/#issuecomment-2180371308): rejected
 - [10xhash](https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/133/#issuecomment-2181094863): rejected
 
+**10xhash**
+
+Fixed
+Now the shutdownTime is moved to the start of the corresponding draw
+
+**sherlock-admin2**
+
+The Lead Senior Watson signed off on the fix.
+
 # Issue M-16: `maxDeposit` doesn't comply with ERC-4626 
 
 Source: https://github.com/sherlock-audit/2024-05-pooltogether-judging/issues/134 
@@ -3779,6 +3896,15 @@ Sherlock rules states
 The protocol team fixed this issue in the following PRs/commits:
 https://github.com/GenerationSoftware/pt-v5-vault/pull/113
 
+
+**10xhash**
+
+Fixed. 
+Now maxDeposit returns 0 unless totalAssets is >= totalDebt + yieldBuffer/2. This will ensure that unless rounding error amounts to yieldBuffer/2, lossyDeposit will not occur
+
+**sherlock-admin2**
+
+The Lead Senior Watson signed off on the fix.
 
 # Issue M-17: `maxRedeem` doesn't comply with ERC-4626 
 
@@ -3923,6 +4049,15 @@ If this cannot happen in normal circonstances (yield vault compliant, so no way 
 The protocol team fixed this issue in the following PRs/commits:
 https://github.com/GenerationSoftware/pt-v5-vault/pull/112
 
+
+**10xhash**
+
+Fixed
+Now maxRedeem returns 0 instead of reverting
+
+**sherlock-admin2**
+
+The Lead Senior Watson signed off on the fix.
 
 # Issue M-18: Users can setup hooks to control the expannsion of tiers 
 
@@ -4235,4 +4370,13 @@ Escalation status:
 The protocol team fixed this issue in the following PRs/commits:
 https://github.com/GenerationSoftware/pt-v5-vault/pull/115
 
+
+**10xhash**
+
+Fixed
+Now ExcessivelySafeCall is used restricting the return/revert data copying to 128 bytes
+
+**sherlock-admin2**
+
+The Lead Senior Watson signed off on the fix.
 
