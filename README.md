@@ -25,11 +25,6 @@ function testAccountedBalance_POC() public {
     awardDraw(1);
     mockTwab(address(this), msg.sender, 0);
   }
-  address otherVault = makeAddr("otherVault");
-  vm.prank(otherVault);
-  prizePool.contributePrizeTokens(otherVault, 0);
-  uint256 prize = claimPrize(msg.sender, 0, 0);
-}
 ```
 
 ## Impact
